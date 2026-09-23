@@ -328,6 +328,27 @@ def get_query_lens_mismatch_unsupported_backend(
     return None
 
 
+def supports_speculative_prompt_tail_graph(
+    attn_groups: list[list[AttentionGroup]],
+    cg_support: AttentionCGSupportInfo,
+    decode_query_len: int,
+) -> bool:
+    """Whether a padded prompt tail can use every group's decode kernels."""
+    if cg_support.min_cg_support.value < AttentionCGSupport.UNIFORM_BATCH.value:
+        return False
+    for groups in attn_groups:
+        for group in groups:
+            builder = group.get_metadata_builder(0)
+            # Sparse-SWA and indexer builders opt out of batch reordering,
+            # but still split prefill/decode at their own decode_threshold.
+            threshold = getattr(
+                builder, "decode_threshold", builder.reorder_batch_threshold
+            )
+            if threshold is not None and threshold < decode_query_len:
+                return False
+    return True
+
+
 def init_kv_cache(
     forward_context: dict[str, Any],
     kv_cache_config: KVCacheConfig,

@@ -94,6 +94,7 @@ from vllm.v1.worker.gpu.attn_utils import (
     get_kv_cache_spec,
     init_attn_backend,
     init_kv_cache,
+    supports_speculative_prompt_tail_graph,
 )
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.buffer_utils import set_default_max_concurrency
@@ -641,6 +642,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
         additional_attn_cg_support = self.model_state.get_additional_cg_support()
         attn_cg_support = attn_cg_support.narrow(*additional_attn_cg_support)
+        self._supports_speculative_prompt_tail_graph = (
+            self.speculative_config is not None
+            and self.speculative_config.use_dspark()
+            and not self.model_config.is_hybrid
+            and not self.model_config.is_attention_free
+            and not self.is_encoder_decoder
+            and not self.supports_mm_inputs
+            and self.parallel_config.pipeline_parallel_size == 1
+            and self.model_state.num_new_sampled_tokens_per_step == 1
+            and supports_speculative_prompt_tail_graph(
+                self.attn_groups, attn_cg_support, self.decode_query_len
+            )
+        )
         # The speculator clears the flag at load time when the checkpoint has
         # no confidence head, so it holds the effective value.
         self.adaptive_verification = maybe_create_adaptive_verification_manager(
@@ -1280,6 +1294,36 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # prompts have no prior state and must stay off FULL decode graphs.
             graph_has_prefill = bool(
                 (is_prefilling_np & (num_computed_prefill_tokens_np == 0)).any()
+            )
+        elif (
+            graph_has_prefill
+            and self.is_pd_consumer
+            and self.decode_query_len > 1
+            and self._supports_speculative_prompt_tail_graph
+            and self.pcp_manager is None
+            and self.adaptive_verification is None
+            and max_query_len == self.decode_query_len
+        ):
+            # Only the final prompt token plus reject-only draft padding may
+            # bypass the prefill veto. Preserve the real state for input prep.
+            graph_has_prefill = not all(
+                n == self.decode_query_len
+                and len(draft_tokens.get(req_id, ())) == n - 1
+                and (
+                    not prefilling
+                    or (
+                        computed > 0
+                        and prompt_len - computed == 1
+                        and all(token == -1 for token in draft_tokens[req_id])
+                    )
+                )
+                for req_id, n, prefilling, computed, prompt_len in zip(
+                    req_ids,
+                    num_scheduled_tokens,
+                    is_prefilling_np,
+                    num_computed_prefill_tokens_np,
+                    prefill_len_np,
+                )
             )
         return batch_state, get_uniform_decode_token_count(
             num_reqs, num_toks, max_query_len, graph_has_prefill

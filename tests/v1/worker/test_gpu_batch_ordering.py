@@ -17,10 +17,15 @@ from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
+import pytest
 import torch
 
-from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.attention.backend import AttentionCGSupport, CommonAttentionMetadata
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
+from vllm.v1.worker.gpu.attn_utils import (
+    AttentionCGSupportInfo,
+    supports_speculative_prompt_tail_graph,
+)
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner, sort_batch_req_ids
 from vllm.v1.worker.utils import get_uniform_decode_token_count
 
@@ -57,6 +62,8 @@ def _make_runner(
     runner.decode_query_len = decode_query_len
     runner.adaptive_verification = None
     runner.is_pd_consumer = False
+    runner.pcp_manager = None
+    runner._supports_speculative_prompt_tail_graph = False
     runner.req_states = SimpleNamespace(
         req_id_to_index={req_id: i for i, req_id in enumerate(req_states)},
         # The runner keeps this as min(num_computed_tokens, prefill_len).
@@ -221,6 +228,103 @@ def test_uniform_decode_predicate():
     assert get_uniform_decode_token_count(2, 16, 8, True) is None
     # 12 tokens over 2 requests is no shared query length.
     assert get_uniform_decode_token_count(2, 12, 8, False) is None
+
+
+@pytest.mark.parametrize(
+    ("width", "case", "expected"),
+    [(width, case, width) for width in (2, 5, 6, 7) for case in ("tail-only", "mixed")]
+    + [(5, "mixed-async", 5)]
+    + [
+        (5, case, None)
+        for case in (
+            "real-prefill",
+            "fresh-prompt",
+            "real-tail-draft",
+            "partial-tail-drafts",
+            "missing-decode-drafts",
+            "ragged",
+            "unsupported-backend",
+            "not-pd-consumer",
+            "pcp",
+            "adaptive",
+        )
+    ],
+)
+def test_dspark_padded_prompt_tail_graph_classification(width, case, expected):
+    """Only complete, supported padded tails may bypass the prefill veto."""
+    requests = {"tail": (127, 128)}
+    if case != "tail-only":
+        requests["decode"] = (256, 128)
+    if case == "real-prefill":
+        requests["tail"] = (128 - width, 128)
+    elif case == "fresh-prompt":
+        requests["tail"] = (0, 1)
+    runner = _make_runner(requests, decode_query_len=width)
+    runner.is_pd_consumer = case != "not-pd-consumer"
+    runner._supports_speculative_prompt_tail_graph = case != "unsupported-backend"
+    if case == "pcp":
+        runner.pcp_manager = object()
+    elif case == "adaptive":
+        runner.adaptive_verification = SimpleNamespace(
+            get_num_tokens=lambda counts, drafts: sum(counts.values())
+        )
+    drafts = {req_id: [-1] * (width - 1) for req_id in requests}
+    if case == "mixed":
+        drafts["decode"] = list(range(width - 1))
+    counts = dict.fromkeys(requests, width)
+    if case == "real-tail-draft":
+        drafts["tail"][0] = 42
+    elif case == "partial-tail-drafts":
+        drafts["tail"].pop()
+    elif case == "missing-decode-drafts":
+        del drafts["decode"]
+    elif case == "ragged":
+        counts["decode"] -= 1
+        drafts["decode"].pop()
+    output = SimpleNamespace(
+        num_scheduled_tokens=counts,
+        total_num_scheduled_tokens=sum(counts.values()),
+        scheduled_spec_decode_tokens=drafts,
+    )
+
+    state, uniform_tok_count = runner.gather_batch_req_state(output, False)
+
+    assert uniform_tok_count == expected
+    assert state.has_prefill
+    tail_index = state.req_ids.index("tail")
+    assert state.is_prefilling_np[tail_index]
+    assert state.num_computed_prefill_tokens_np[tail_index] == requests["tail"][0]
+
+
+@pytest.mark.parametrize(
+    ("cg_support", "threshold", "expected"),
+    [
+        (AttentionCGSupport.UNIFORM_BATCH, 5, True),
+        (AttentionCGSupport.ALWAYS, 5, True),
+        (AttentionCGSupport.UNIFORM_BATCH, 1, False),
+        (AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE, 5, False),
+    ],
+)
+def test_prompt_tail_graph_checks_effective_backend_threshold(
+    cg_support, threshold, expected
+):
+    builders = [
+        SimpleNamespace(reorder_batch_threshold=5),
+        SimpleNamespace(reorder_batch_threshold=None, decode_threshold=threshold),
+        SimpleNamespace(reorder_batch_threshold=None),
+    ]
+    groups = [
+        [
+            SimpleNamespace(get_metadata_builder=lambda _index, b=builder: b)
+            for builder in builders
+        ]
+    ]
+    assert (
+        supports_speculative_prompt_tail_graph(
+            groups, AttentionCGSupportInfo(cg_support), decode_query_len=5
+        )
+        is expected
+    )
 
 
 def test_no_speculator_dispatches_on_query_length_alone():
