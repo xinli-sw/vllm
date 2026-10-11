@@ -5,6 +5,7 @@ import torch
 from torch.nn import Module
 
 from vllm._custom_ops import scaled_fp4_quant
+from vllm.model_executor.kernels.linear import init_nvfp4_linear_kernel
 from vllm.model_executor.layers.fused_moe import RoutedExperts
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEConfig,
@@ -15,6 +16,11 @@ from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
     make_nvfp4_moe_kernel,
     make_nvfp4_moe_quant_config,
     select_nvfp4_moe_backend,
+)
+from vllm.model_executor.layers.linear import register_weight_loader_v2_supported_method
+from vllm.model_executor.layers.quantization.online.fp8 import (
+    OnlineLinearBase,
+    _is_tp_sharded,
 )
 from vllm.model_executor.layers.quantization.online.moe_base import (
     OnlineMoEMethodBase,
@@ -27,6 +33,7 @@ from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import 
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     amax_for_moe_weight_quant,
+    amax_for_tp_weight_quant,
     kNvfp4DynamicToken,
     kNvfp4Static,
     weight_amax,
@@ -214,3 +221,39 @@ class Nvfp4OnlineMoEMethod(OnlineMoEMethodBase):
             swiglu_limit=getattr(layer, "swiglu_limit", None),
             layer=layer,
         )
+
+
+@register_weight_loader_v2_supported_method
+class Nvfp4W4A16OnlineLinearMethod(OnlineLinearBase):
+    """Load-time NVFP4 weights; retain BF16 activations for shared experts."""
+
+    activation_quant_key = None
+
+    def __init__(self):
+        super().__init__()
+        if not current_platform.is_device_capability_family(100):
+            raise ValueError("Experimental NVFP4 W4A16 requires SM100-family GPUs")
+        self.kernel = init_nvfp4_linear_kernel(use_a16=True)
+
+    def process_weights_after_loading(self, layer: Module) -> None:
+        if getattr(layer, "_already_called_process_weights_after_loading", False):
+            return
+        weight = self.get_weight_for_quantization(layer).contiguous()
+        if weight.ndim != 2 or weight.shape[-1] % 16:
+            raise ValueError("NVFP4 W4A16 requires a 2D weight with K divisible by 16")
+        amax = weight_amax(weight).reshape(1).float()
+        amax = amax_for_tp_weight_quant(amax, _is_tp_sharded(layer)).clamp_min(1e-8)
+        global_scale = amax / (FLOAT4_E2M1_MAX * FLOAT8_E4M3_MAX)
+        packed, blocks = scaled_fp4_quant(
+            weight, global_scale.reciprocal(), is_sf_swizzled_layout=False
+        )
+        replace_parameter(layer, "weight", packed)
+        replace_parameter(layer, "weight_scale", blocks)
+        replace_parameter(layer, "weight_global_scale", global_scale)
+        layer.is_w4a16_nvfp4 = True
+        self.release_requantization_source_weights(layer)
+        self.kernel.process_weights_after_loading(layer)
+        layer._already_called_process_weights_after_loading = True
+
+    def apply(self, layer, x, bias=None):
+        return self.kernel.apply_weights(layer, x, bias)
