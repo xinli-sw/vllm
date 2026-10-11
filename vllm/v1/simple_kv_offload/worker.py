@@ -255,9 +255,15 @@ class SimpleCPUOffloadWorker:
             self._pending_load_event_indices.add(metadata.load_event)
         if metadata.store_event >= 0:
             self._pending_store_event_indices.add(metadata.store_event)
+        # The step's CUDA work (forward, sampling, connector post-forward) runs
+        # until clear_connector_metadata(); batch copies wait for it.
+        if isinstance(self._backend, DmaCopyBackend):
+            self._backend.set_host_busy(True)
 
     def clear_connector_metadata(self) -> None:
         self._connector_metadata = None
+        if isinstance(self._backend, DmaCopyBackend):
+            self._backend.set_host_busy(False)
 
     def start_load_kv(self) -> None:
         # Invoked after the forward launch on steps without sync loads

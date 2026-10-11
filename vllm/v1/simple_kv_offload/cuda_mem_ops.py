@@ -3,6 +3,7 @@
 """Low-level CUDA/HIP memory helpers: pinning and batch DMA transfers."""
 
 import ctypes
+from collections.abc import Callable
 from typing import Any, NamedTuple
 
 import numpy as np
@@ -228,8 +229,16 @@ def copy_blocks(
     src_block_ids: list[int],
     dst_block_ids: list[int],
     params: BatchMemcpyParams,
+    max_descriptors: int = 0,
+    before_chunk: Callable[[], None] | None = None,
 ) -> None:
-    """Copy blocks via cuMemcpyBatchAsync / hipMemcpyBatchAsync."""
+    """Copy blocks via cuMemcpyBatchAsync / hipMemcpyBatchAsync.
+
+    ``max_descriptors`` (> 0) splits the copy into calls of at most that many
+    descriptors, and ``before_chunk`` runs before each call. Every call holds
+    a driver lock other CUDA calls in the process wait on, for a time that
+    grows with its descriptor count.
+    """
     n = len(src_block_ids)
     if n == 0:
         return
@@ -250,10 +259,15 @@ def copy_blocks(
     total = n * params.num_layers
 
     # Chunk on ROCm: hipMemcpyBatchAsync faults above 8192 descriptors/call.
-    # CUDA is uncapped (max_desc == 0) and issues a single call.
+    # CUDA is uncapped (max_desc == 0) and issues a single call unless the
+    # caller bounds the descriptors per call.
     max_desc = _resolve_max_batch_descriptors()
+    if max_descriptors > 0:
+        max_desc = max_descriptors if max_desc <= 0 else min(max_desc, max_descriptors)
     step = total if max_desc <= 0 else max_desc
     for off in range(0, total, step):
+        if before_chunk is not None:
+            before_chunk()
         cnt = min(step, total - off)
         err = fn(
             dst_all[off : off + cnt].ctypes.data,

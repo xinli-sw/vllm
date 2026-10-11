@@ -4,8 +4,10 @@
 
 from __future__ import annotations
 
+import os
 import queue
 import threading
+import time
 from collections import deque
 from collections.abc import Callable
 from typing import NamedTuple
@@ -30,6 +32,22 @@ logger = init_logger(__name__)
 _GATE_POLL_MIN_S = 5e-5
 _GATE_POLL_MAX_S = 5e-4
 
+# Paced batch copies. One cuMemcpyBatchAsync call holds a driver lock that every
+# other CUDA call in the process waits on, for ~1.6 us per descriptor (one per
+# block per KV region): a CPU-tier load of a few thousand blocks issued as one
+# call blocks the worker's main thread for ~1 s, and with it the next step. The
+# copy thread instead issues at most _COPY_CHUNK_DESCRIPTORS descriptors per
+# call (0 disables chunking), and starts a call only while the worker's main
+# thread is between steps (see DmaCopyBackend.set_host_busy), waiting at most
+# _COPY_MAX_PAUSE_S per call for it.
+_COPY_CHUNK_DESCRIPTORS = int(
+    os.environ.get("VLLM_SIMPLE_KV_COPY_CHUNK_DESCRIPTORS", "768")
+)
+_COPY_MAX_PAUSE_S = (
+    float(os.environ.get("VLLM_SIMPLE_KV_COPY_MAX_PAUSE_MS", "50")) / 1000.0
+)
+_COPY_PAUSE_POLL_S = 1e-4
+
 
 class _Copy(NamedTuple):
     src_blocks: list[int]
@@ -39,6 +57,7 @@ class _Copy(NamedTuple):
     event_idx: int
     events_list: list[tuple[int, torch.Event]]
     wait_event: torch.Event | None
+    pace: Callable[[], None] | None
 
 
 class DmaCopyBackend:
@@ -67,6 +86,10 @@ class DmaCopyBackend:
         # Copies queued but not yet submitted to their stream (see wait_idle).
         self._num_queued = 0
         self._idle = threading.Condition()
+        # Set while the worker's main thread issues a step's CUDA work (copy
+        # calls then wait); cleared between steps, and ignored while draining.
+        self._host_busy = False
+        self._draining = False
 
     def init(
         self,
@@ -131,17 +154,36 @@ class DmaCopyBackend:
                 event_idx,
                 events_list,
                 wait_event,
+                self._pace if _COPY_CHUNK_DESCRIPTORS > 0 else None,
             )
         )
+
+    def set_host_busy(self, busy: bool) -> None:
+        """Mark whether the worker's main thread is issuing a step's CUDA work;
+        while it is, the copy thread holds back its next batch-copy call."""
+        self._host_busy = busy
+
+    def _pace(self) -> None:
+        """Copy thread, before each batch-copy call: wait (bounded) until the
+        main thread is between steps."""
+        if not self._host_busy or self._draining:
+            return
+        deadline = time.monotonic() + _COPY_MAX_PAUSE_S
+        while self._host_busy and not self._draining and time.monotonic() < deadline:
+            time.sleep(_COPY_PAUSE_POLL_S)
 
     def wait_idle(self) -> None:
         """Block until every queued copy is submitted to its stream, i.e. its
         completion event is in its ``events_list``. Returns early if the copy
-        thread has died."""
+        thread has died. Queued copies are issued without pacing meanwhile."""
         thread = self._thread
-        with self._idle:
-            while self._num_queued and thread is not None and thread.is_alive():
-                self._idle.wait(timeout=1.0)
+        self._draining = True
+        try:
+            with self._idle:
+                while self._num_queued and thread is not None and thread.is_alive():
+                    self._idle.wait(timeout=1.0)
+        finally:
+            self._draining = False
 
     def _submitted(self) -> None:
         with self._idle:
@@ -217,7 +259,13 @@ class DmaCopyBackend:
 
     @staticmethod
     def _submit(copy: _Copy, stream: torch.cuda.Stream) -> None:
-        copy_blocks(copy.src_blocks, copy.dst_blocks, copy.params)
+        copy_blocks(
+            copy.src_blocks,
+            copy.dst_blocks,
+            copy.params,
+            max_descriptors=_COPY_CHUNK_DESCRIPTORS,
+            before_chunk=copy.pace,
+        )
         event = torch.Event()
         event.record(stream)
         copy.events_list.append((copy.event_idx, event))
