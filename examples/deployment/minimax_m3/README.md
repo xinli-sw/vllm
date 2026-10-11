@@ -14,3 +14,8 @@ vllm serve nvidia/MiniMax-M3-NVFP4 --config b200.yaml
 ```
 
 For B300, use `b300.env` and `b300.yaml`.
+
+The B300 recipe fuses the shared expert into the routed NVFP4 MoE kernel.
+With fusion enabled, routed and shared experts use NVFP4 weights and
+activations (W4A4), including shared experts targeted as `nvfp4_w4a16`.
+Without fusion, that target keeps BF16 activations (W4A16).

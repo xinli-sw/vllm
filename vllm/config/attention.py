@@ -55,7 +55,7 @@ class AttentionConfig:
     `max_model_len` >= 256k; "off" keeps the replicated cache. Unsupported
     deployments fall back to the replicated cache."""
 
-    minimax_m3_indexer_prefill_kv_split: bool = False
+    minimax_m3_indexer_prefill_kv_split: bool = True
     """Use the bounded split-KV indexer prefill planner."""
 
     backend_per_kind: dict[str, AttentionBackendEnum] = field(default_factory=dict)

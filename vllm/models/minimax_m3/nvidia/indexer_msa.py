@@ -184,11 +184,11 @@ class MiniMaxM3IndexerMSAMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
         self.use_bounded_prefill_split = (
             vllm_config.attention_config.minimax_m3_indexer_prefill_kv_split
         )
-        if envs.VLLM_MINIMAX_M3_INDEXER_PREFILL_PRECOMPILE:
-            if not self.use_bounded_prefill_split:
-                raise ValueError(
-                    "Prefill precompile requires the bounded split planner"
-                )
+        precompile = (
+            self.use_bounded_prefill_split
+            and vllm_config.kernel_config.enable_jit_warmup
+        )
+        if precompile:
             from vllm.third_party.fmha_sm100.api import _compute_pack_factor
             from vllm.third_party.fmha_sm100.jit import (
                 _dlpack_dtype_code,
@@ -205,9 +205,9 @@ class MiniMaxM3IndexerMSAMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
         ).multi_processor_count
         logger.info_once(
             "MiniMax indexer prefill: host_metadata=%s bounded_split=%s precompile=%s",
-            envs.VLLM_MINIMAX_M3_INDEXER_SYNC_FREE_METADATA,
+            True,
             self.use_bounded_prefill_split,
-            envs.VLLM_MINIMAX_M3_INDEXER_PREFILL_PRECOMPILE,
+            precompile,
         )
         self.kv_split: PrefillKVSplitPlanner | None = None
         if envs.VLLM_MINIMAX_M3_INDEXER_PREFILL_KV_SPLIT:
@@ -292,16 +292,13 @@ class MiniMaxM3IndexerMSAMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
             qsl_cpu = common_attn_metadata.query_start_loc_cpu[: num_reqs + 1]
             qo_lens_cpu = (qsl_cpu[1:] - qsl_cpu[:-1]).to(torch.int32)
             side_qo = qo_lens_cpu[lo:hi]
-            side_kv = None
-            sync_free = envs.VLLM_MINIMAX_M3_INDEXER_SYNC_FREE_METADATA
-            if sync_free:
-                side_kv = _host_prefill_kv_lens(
-                    common_attn_metadata.seq_lens_cpu_upper_bound,
-                    side_qo,
-                    lo,
-                    hi,
-                    self.reorder_batch_threshold,
-                )
+            side_kv = _host_prefill_kv_lens(
+                common_attn_metadata.seq_lens_cpu_upper_bound,
+                side_qo,
+                lo,
+                hi,
+                self.reorder_batch_threshold,
+            )
             if side_kv is None:
                 side_kv = seq_lens[lo:hi].cpu().to(torch.int32)
             split = None
@@ -363,23 +360,15 @@ class MiniMaxM3IndexerMSAMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
                 # max_k_tiles >= the plan's natural value, so the extra tiles
                 # are simply never written.
                 plan["max_k_tiles"] = max_k_tiles
-                if sync_free:
-                    assert int(side_kv.max()) <= block_table.shape[1] * PAGE_SIZE
-                    rows, cols = _segment_page_index(
-                        list(range(hi - lo)), side_kv.tolist()
-                    )
-                    index_cpu = torch.empty(
-                        (2, len(rows)), dtype=torch.int64, pin_memory=True
-                    )
-                    index_cpu[0].numpy()[:] = rows
-                    index_cpu[1].numpy()[:] = cols
-                    index = index_cpu.to(block_table.device, non_blocking=True)
-                    page_table = block_table[lo:hi][index[0], index[1]].to(torch.int32)
-                else:
-                    nvp = (side_kv + PAGE_SIZE - 1) // PAGE_SIZE
-                    cols = torch.arange(block_table.shape[1], device=block_table.device)
-                    valid = cols[None, :] < nvp.to(block_table.device)[:, None]
-                    page_table = block_table[lo:hi][valid].to(torch.int32)
+                assert int(side_kv.max()) <= block_table.shape[1] * PAGE_SIZE
+                rows, cols = _segment_page_index(list(range(hi - lo)), side_kv.tolist())
+                index_cpu = torch.empty(
+                    (2, len(rows)), dtype=torch.int64, pin_memory=True
+                )
+                index_cpu[0].numpy()[:] = rows
+                index_cpu[1].numpy()[:] = cols
+                index = index_cpu.to(block_table.device, non_blocking=True)
+                page_table = block_table[lo:hi][index[0], index[1]].to(torch.int32)
             gather_pages = None
             if self.idxk_tp > 1:
                 # Split-KV slices reuse physical pages. Gather each page once

@@ -25,10 +25,9 @@ bf16-rounded logits this kernel accumulates. The stock GEMM may sum K in a
 different order (cuBLAS picks split-K kernels for small batches), so a logit
 can round to an adjacent bf16 value and a near-tie between the two largest
 logits can resolve differently. Draft tokens only change what the target
-verifies, never the output distribution, but because the tokens are not bit
-identical to ``get_top_tokens`` this path is opt-in
-(``VLLM_USE_FUSED_DRAFT_ARGMAX=1``). The keys of a row of x do not depend on
-the other rows of the batch.
+verifies, never the output distribution. Eligible local-argmax draft heads
+use this kernel automatically; batch-invariant mode retains the stock path.
+The keys of a row of x do not depend on the other rows of the batch.
 
 Receive slots alternate between two sets by call parity. A rank pushes call
 ``n + 2`` (the set of ``n``) only after it read every peer's call ``n + 1``
@@ -329,8 +328,7 @@ def supports_fused_argmax(
     weight = getattr(lm_head, "weight", None)
     shard = lm_head.shard_indices
     ok = (
-        envs.VLLM_USE_FUSED_DRAFT_ARGMAX
-        and current_platform.is_cuda()
+        current_platform.is_cuda()
         and current_platform.is_device_capability_family(100)
         and not envs.VLLM_BATCH_INVARIANT
         and type(lm_head.quant_method) is UnquantizedEmbeddingMethod
