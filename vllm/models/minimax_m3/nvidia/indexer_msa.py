@@ -50,6 +50,8 @@ from vllm.models.minimax_m3.nvidia.indexer_decode_cp import get_indexer_decode_c
 from vllm.models.minimax_m3.nvidia.indexer_kv_split import PrefillKVSplitPlanner
 from vllm.models.minimax_m3.nvidia.indexer_prefill_plan import (
     _host_prefill_kv_lens,
+    _plan_prefill_segments,
+    _PREFILL_MAX_KV_SPLITS,
     _segment_page_index,
 )
 from vllm.models.minimax_m3.nvidia.ops import minimax_m3_index_decode_score_cutedsl
@@ -175,6 +177,10 @@ class MiniMaxM3IndexerMSAMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
         )
         # Split-KV prefill score plan (bit-identical scores; see
         # indexer_kv_split).
+        self.use_bounded_prefill_split = (
+            vllm_config.attention_config.minimax_m3_indexer_prefill_kv_split
+        )
+        self.prefill_num_sms = torch.cuda.get_device_properties(device).multi_processor_count
         self.kv_split: PrefillKVSplitPlanner | None = None
         if envs.VLLM_MINIMAX_M3_INDEXER_PREFILL_KV_SPLIT:
             self.kv_split = PrefillKVSplitPlanner(
@@ -267,11 +273,34 @@ class MiniMaxM3IndexerMSAMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
                 )
             if side_kv is None:
                 side_kv = seq_lens[lo:hi].cpu().to(torch.int32)
-            split = (
-                None
-                if self.kv_split is None
-                else self.kv_split.plan(side_qo, side_kv, block_table[lo:hi])
-            )
+            split = None
+            if self.use_bounded_prefill_split:
+                max_splits = _PREFILL_MAX_KV_SPLITS
+                num_rows = common_attn_metadata.num_actual_tokens - int(qsl_cpu[lo])
+                if num_rows != int(side_qo.sum()):
+                    max_splits = 1
+                seg_qo, seg_kv, seg_req, num_kv_splits = _plan_prefill_segments(
+                    side_qo.tolist(), side_kv.tolist(), self.num_index_heads,
+                    self.prefill_num_sms, max_splits,
+                )
+                seg_qo_t = torch.tensor(seg_qo, dtype=torch.int32)
+                seg_kv_t = torch.tensor(seg_kv, dtype=torch.int32)
+                plan = _fmha_sm100_plan(
+                    seg_qo_t, seg_kv_t, self.num_index_heads, num_kv_heads=1,
+                    qo_offset=seg_kv_t - seg_qo_t, page_size=PAGE_SIZE,
+                    output_maxscore=True, causal=True, num_kv_splits=num_kv_splits,
+                )
+                plan["max_k_tiles"] = max_k_tiles
+                assert max(seg_kv) <= block_table.shape[1] * PAGE_SIZE
+                rows, cols = _segment_page_index(seg_req, seg_kv)
+                index_cpu = torch.empty((2, len(rows)), dtype=torch.int64, pin_memory=True)
+                index_cpu[0].numpy()[:] = rows
+                index_cpu[1].numpy()[:] = cols
+                index = index_cpu.to(block_table.device, non_blocking=True)
+                page_table = block_table[lo:hi][index[0], index[1]].to(torch.int32)
+                split = plan, page_table
+            elif self.kv_split is not None:
+                split = self.kv_split.plan(side_qo, side_kv, block_table[lo:hi])
             if split is not None:
                 plan, page_table = split
             else:
