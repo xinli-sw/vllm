@@ -217,7 +217,6 @@ if TYPE_CHECKING:
     VLLM_KIMI_K3_AUX_ATTN_RES_STREAM: bool = False
     VLLM_KIMI_K3_GEMM_AR: bool = True
     VLLM_MINIMAX_M3_SPARSE_DECODE_FP16_DOT: bool = False
-    VLLM_MINIMAX_M3_SPARSE_DECODE_FILL_SMS: bool = False
     VLLM_ENABLE_GEMM_RS: bool = False
     VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER: bool = True
     VLLM_USE_FLASHINFER_MOE_INT4: bool = False
@@ -226,8 +225,6 @@ if TYPE_CHECKING:
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
     VLLM_FLASHINFER_MOE_A2A_LOW_PRECISION_COMBINE: bool = False
-    VLLM_MINIMAX_M3_INDEXER_PREFILL_PRECOMPILE: bool = False
-    VLLM_MINIMAX_M3_INDEXER_SYNC_FREE_METADATA: bool = False
     VLLM_MINIMAX_M3_INDEXER_PREFILL_KV_SPLIT: bool = True
     VLLM_XGRAMMAR_CACHE_MB: int = 0
     VLLM_REGEX_COMPILATION_TIMEOUT_S: int = 5
@@ -278,7 +275,6 @@ if TYPE_CHECKING:
     VLLM_ALLREDUCE_USE_SYMM_MEM: bool = True
     VLLM_ALLREDUCE_USE_FLASHINFER: bool = True
     VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC: bool = False
-    VLLM_USE_FUSED_DRAFT_ARGMAX: bool = False
     VLLM_TUNED_CONFIG_FOLDER: str | None = None
     VLLM_ENABLE_STARTUP_PLAN: bool = False
     VLLM_GPT_OSS_SYSTEM_TOOL_MCP_LABELS: set[str] = set()
@@ -1686,12 +1682,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_MINIMAX_M3_SPARSE_DECODE_FP16_DOT": lambda: bool(
         int(os.getenv("VLLM_MINIMAX_M3_SPARSE_DECODE_FP16_DOT", "0"))
     ),
-    # MiniMax-M3 Triton sparse decode (CUDA only): size the split-K chunk count
-    # to one wave of resident programs on the device instead of a fixed
-    # 256-program target. Changes the split-K reduction, so off by default.
-    "VLLM_MINIMAX_M3_SPARSE_DECODE_FILL_SMS": lambda: bool(
-        int(os.getenv("VLLM_MINIMAX_M3_SPARSE_DECODE_FILL_SMS", "0"))
-    ),
     # Fuse eligible sequence-parallel row-parallel projections with their TP
     # reduce-scatter using the SM100 BF16/MXFP8 GEMM-RS kernel (Kimi-K3
     # attention/shared-expert projections, DeepSeek-V4.1 ``wo_b``). All TP
@@ -1714,12 +1704,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # split-KV over <=128-token query slices so short prefill chunks over long
     # contexts fill the GPU. The block scores (and top-k) are bit-identical to
     # the unsplit plan. Set to 0 to keep the unsplit plan.
-    "VLLM_MINIMAX_M3_INDEXER_PREFILL_PRECOMPILE": lambda: bool(
-        int(os.getenv("VLLM_MINIMAX_M3_INDEXER_PREFILL_PRECOMPILE", "0"))
-    ),
-    "VLLM_MINIMAX_M3_INDEXER_SYNC_FREE_METADATA": lambda: bool(
-        int(os.getenv("VLLM_MINIMAX_M3_INDEXER_SYNC_FREE_METADATA", "0"))
-    ),
     "VLLM_MINIMAX_M3_INDEXER_PREFILL_KV_SPLIT": lambda: bool(
         int(os.getenv("VLLM_MINIMAX_M3_INDEXER_PREFILL_KV_SPLIT", "1"))
     ),
@@ -1984,14 +1968,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # integration is being qualified.
     "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC": lambda: bool(
         int(os.getenv("VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC", "0"))
-    ),
-    # Whether greedy draft heads on the local-argmax path
-    # (speculative_config.use_local_argmax_reduction) use the fused
-    # vocab-parallel lm_head GEMV + argmax kernel (Blackwell, unscaled bf16
-    # heads). Its fp32 accumulation order can differ from the stock GEMM's, so
-    # near-ties may pick a different draft token; opt-in.
-    "VLLM_USE_FUSED_DRAFT_ARGMAX": lambda: bool(
-        int(os.getenv("VLLM_USE_FUSED_DRAFT_ARGMAX", "0"))
     ),
     # Experimental: use this to enable MCP tool calling for non harmony models
     "VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT": lambda: bool(
