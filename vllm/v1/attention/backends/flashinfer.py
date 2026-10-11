@@ -86,6 +86,7 @@ from vllm.v1.attention.ops.dcp import (
     dcp_a2a_lse_reduce,
 )
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
+from vllm.v1.attention.ops.trtllm_balanced_decode import TrtllmBalancedDecode
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheLayout,
@@ -143,6 +144,58 @@ def _get_trtllm_workspace_buffer():
             envs.VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE, dtype=torch.uint8, device="cuda"
         )
     return trtllm_workspace_buffer
+
+
+# Length-balanced trtllm-gen decode (see
+# vllm/v1/attention/ops/trtllm_balanced_decode.py). Its static buffers are
+# shared by every eligible FlashInfer layer of the process, since layers run
+# one at a time; keyed by the shape parameters the buffers are sized from.
+_balanced_decode_cache: dict[tuple, TrtllmBalancedDecode] = {}
+
+
+def _get_balanced_decode(
+    vllm_config: VllmConfig | None,
+    num_kv_heads: int,
+    head_size: int,
+    kv_cache_dtype: str,
+    eligible: bool,
+) -> TrtllmBalancedDecode | None:
+    if vllm_config is None or not eligible:
+        return None
+    if not vllm_config.attention_config.flashinfer_balanced_decode:
+        return None
+    if not (
+        current_platform.is_device_capability_family(100)
+        and num_kv_heads == 1
+        and head_size == 128
+        and kv_cache_dtype in ("fp8", "fp8_e4m3")
+        and vllm_config.parallel_config.decode_context_parallel_size == 1
+    ):
+        return None
+    device = torch.device("cuda", torch.cuda.current_device())
+    key = (
+        device,
+        vllm_config.model_config.max_model_len,
+        vllm_config.cache_config.block_size,
+        vllm_config.scheduler_config.max_num_seqs,
+    )
+    balanced = _balanced_decode_cache.get(key)
+    if balanced is None:
+        balanced = TrtllmBalancedDecode(
+            device,
+            max_model_len=key[1],
+            page_size=key[2],
+            max_num_reqs=key[3],
+        )
+        _balanced_decode_cache[key] = balanced
+        logger.info_once(
+            "FlashInfer trtllm-gen decode: length-balanced split-KV enabled "
+            "(%d chunks per call, >= %d pages per chunk, >= %d decodes).",
+            balanced.target_chunks,
+            balanced.min_chunk_pages,
+            balanced.min_decodes,
+        )
+    return balanced
 
 
 def _pack_draft_block_bool_mask(
@@ -1931,6 +1984,20 @@ class FlashInferImpl(AttentionImpl):
         else:
             self._nvfp4_fp8_out = None
 
+        self.balanced_decode = _get_balanced_decode(
+            vllm_config,
+            num_kv_heads,
+            head_size,
+            self.kv_cache_dtype,
+            eligible=(
+                self.supports_xqa_or_trtllm_gen_decode
+                and sinks is None
+                and self.window_left == -1
+                and alibi_slopes is None
+                and not logits_soft_cap
+            ),
+        )
+
         dcp_a2a = (
             vllm_config is not None
             and vllm_config.parallel_config.decode_context_parallel_size > 1
@@ -2565,6 +2632,35 @@ class FlashInferImpl(AttentionImpl):
                     q_len_per_req = 1
                 else:
                     q_len_per_req = num_decode_tokens // attn_metadata.num_decodes
+
+                if (
+                    self.balanced_decode is not None
+                    and not use_dcp
+                    and not needs_fp8_out
+                    and q_len_per_req is not None
+                    and not self.need_to_return_lse_for_decode
+                    and output.dtype == torch.bfloat16
+                    and num_decode_tokens == attn_metadata.num_decodes * q_len_per_req
+                    and self.balanced_decode.supports(
+                        attn_metadata.num_decodes,
+                        q_len_per_req,
+                        self.num_heads,
+                        self.head_size,
+                        kv_cache_tuple[0].shape[2],
+                    )
+                ):
+                    self.balanced_decode.run(
+                        decode_query,
+                        kv_cache_tuple,
+                        workspace_buffer,
+                        block_tables_decode,
+                        seq_lens_decode,
+                        q_len_per_req,
+                        self.bmm1_scale,
+                        self.bmm2_scale,
+                        out,
+                    )
+                    return output_padded
 
                 lse = None
                 if use_dcp:

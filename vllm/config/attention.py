@@ -90,6 +90,19 @@ class AttentionConfig:
     disable_flashinfer_q_quantization: bool = False
     """If set, when using fp8 kv, do not quantize Q to fp8."""
 
+    flashinfer_balanced_decode: bool = True
+    """Length-balanced split-KV for FlashInfer trtllm-gen decode on SM100.
+    trtllm-gen gives every sequence of a decode batch the same number of KV
+    CTAs, sized from `max_seq_len` (`max_model_len` under full CUDA graphs), so
+    with mixed long contexts the longest request sets the kernel time. When
+    enabled, each eligible decode call is re-batched into equal page-aligned KV
+    chunks planned on the GPU from the live sequence lengths, and the chunk
+    outputs are merged by their log-sum-exp. Only used for layers with one KV
+    head per rank, head size 128, an fp8 KV cache, bf16 output, no sinks,
+    sliding window, ALiBi or soft-cap, and at least 4 decode requests; all
+    other calls use the stock kernel. Outputs match the stock kernel within
+    rounding but are not bit-identical."""
+
     mla_prefill_backend: MLAPrefillBackendEnum | None = None
     """MLA prefill backend to use. If None, will be selected automatically.
     Valid options: FLASH_ATTN (FA3/FA4), FLASHINFER, TRTLLM_RAGGED."""
