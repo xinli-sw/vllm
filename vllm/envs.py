@@ -221,6 +221,7 @@ if TYPE_CHECKING:
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
     VLLM_FLASHINFER_MOE_A2A_LOW_PRECISION_COMBINE: bool = False
+    VLLM_MINIMAX_M3_INDEXER_PREFILL_KV_SPLIT: bool = True
     VLLM_XGRAMMAR_CACHE_MB: int = 0
     VLLM_REGEX_COMPILATION_TIMEOUT_S: int = 5
     VLLM_MSGPACK_ZERO_COPY_THRESHOLD: int = 256
@@ -1669,6 +1670,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Allow use of FlashInfer MxInt4 MoE kernels for fused moe ops.
     "VLLM_USE_FLASHINFER_MOE_INT4": lambda: bool(
         int(os.getenv("VLLM_USE_FLASHINFER_MOE_INT4", "0"))
+    ),
+    # MiniMax-M3 MSA (SM100) indexer: plan the prefill index score with
+    # split-KV over <=128-token query slices so short prefill chunks over long
+    # contexts fill the GPU. The block scores (and top-k) are bit-identical to
+    # the unsplit plan. Set to 0 to keep the unsplit plan.
+    "VLLM_MINIMAX_M3_INDEXER_PREFILL_KV_SPLIT": lambda: bool(
+        int(os.getenv("VLLM_MINIMAX_M3_INDEXER_PREFILL_KV_SPLIT", "1"))
     ),
     # Control the cache sized used by the xgrammar compiler. The default
     # of 512 MB should be enough for roughly 1000 JSON schemas.

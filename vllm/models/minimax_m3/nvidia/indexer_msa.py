@@ -26,6 +26,7 @@ from typing import ClassVar
 
 import torch
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.forward_context import get_forward_context
 from vllm.models.minimax_m3.common.indexer import (
@@ -38,6 +39,7 @@ from vllm.models.minimax_m3.common.indexer import (
 from vllm.models.minimax_m3.common.ops.index_topk import (
     minimax_m3_index_decode_score,
 )
+from vllm.models.minimax_m3.nvidia.indexer_kv_split import PrefillKVSplitPlanner
 from vllm.models.minimax_m3.nvidia.ops import minimax_m3_index_decode_score_cutedsl
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -136,6 +138,13 @@ class MiniMaxM3IndexerMSAMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
             dtype=torch.float32,
             device=device,
         )
+        # Split-KV prefill score plan (bit-identical scores; see
+        # indexer_kv_split).
+        self.kv_split: PrefillKVSplitPlanner | None = None
+        if envs.VLLM_MINIMAX_M3_INDEXER_PREFILL_KV_SPLIT:
+            self.kv_split = PrefillKVSplitPlanner(
+                self.num_index_heads, PAGE_SIZE, MAX_K_TILES, device
+            )
 
     def build(
         self,
@@ -208,24 +217,34 @@ class MiniMaxM3IndexerMSAMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
             nvp = (kv_lens_cpu + PAGE_SIZE - 1) // PAGE_SIZE
             side_qo = qo_lens_cpu[lo:hi]
             side_kv = kv_lens_cpu[lo:hi]
-            plan = _fmha_sm100_plan(
-                side_qo,
-                side_kv,
-                self.num_index_heads,
-                num_kv_heads=1,
-                qo_offset=side_kv - side_qo,  # bottom-right causal
-                page_size=PAGE_SIZE,
-                output_maxscore=True,
-                causal=True,
-                num_kv_splits=1,
+            split = (
+                None
+                if self.kv_split is None
+                else self.kv_split.plan(side_qo, side_kv, block_table[lo:hi])
             )
-            # Force the plan's tile dim to the unified buffer's so prefill writes
-            # its max_score straight into unified[:, :, nd:] (the stride-aware
-            # binding shape-matches the tile dim exactly). max_k_tiles >= the
-            # plan's natural value, so the extra tiles are simply never written.
-            plan["max_k_tiles"] = max_k_tiles
-            cols = torch.arange(block_table.shape[1], device=block_table.device)
-            valid = cols[None, :] < nvp[lo:hi].to(block_table.device)[:, None]
+            if split is not None:
+                plan, page_table = split
+            else:
+                plan = _fmha_sm100_plan(
+                    side_qo,
+                    side_kv,
+                    self.num_index_heads,
+                    num_kv_heads=1,
+                    qo_offset=side_kv - side_qo,  # bottom-right causal
+                    page_size=PAGE_SIZE,
+                    output_maxscore=True,
+                    causal=True,
+                    num_kv_splits=1,
+                )
+                # Force the plan's tile dim to the unified buffer's so prefill
+                # writes its max_score straight into unified[:, :, nd:] (the
+                # stride-aware binding shape-matches the tile dim exactly).
+                # max_k_tiles >= the plan's natural value, so the extra tiles
+                # are simply never written.
+                plan["max_k_tiles"] = max_k_tiles
+                cols = torch.arange(block_table.shape[1], device=block_table.device)
+                valid = cols[None, :] < nvp[lo:hi].to(block_table.device)[:, None]
+                page_table = block_table[lo:hi][valid].to(torch.int32)
             prefill = MiniMaxM3IndexerMSAPrefillMetadata(
                 plan=plan,
                 cu_seqlens_q=(query_start_loc[lo : hi + 1] - query_start_loc[lo]).to(
@@ -233,7 +252,7 @@ class MiniMaxM3IndexerMSAMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
                 ),
                 prefix_lens=context_lens[lo:hi],
                 max_query_len=int(side_qo.max()),
-                page_table=block_table[lo:hi][valid].to(torch.int32),
+                page_table=page_table,
             )
 
         return MiniMaxM3IndexerMSAMetadata(
