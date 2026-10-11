@@ -55,6 +55,7 @@ from vllm.model_executor.layers.quantization.online.mxfp8 import (
 )
 from vllm.model_executor.layers.quantization.online.nvfp4 import (
     Nvfp4OnlineMoEMethod,
+    Nvfp4W4A16OnlineLinearMethod,
 )
 from vllm.model_executor.layers.quantization.utils.config_utils import (
     find_matching_patterns,
@@ -88,6 +89,7 @@ class OnlineQuantizationSource(str, Enum):
 # corresponding method class handles the activation choice via its
 # `supported_activation_quant` set.
 _ONLINE_LINEAR_METHODS: dict[QuantKey, type] = {
+    kNvfp4Static: Nvfp4W4A16OnlineLinearMethod,
     kFp8StaticTensorSym: Fp8PerTensorOnlineLinearMethod,
     kFp8Static128BlockSym: Fp8PerBlockOnlineLinearMethod,
     kFp8StaticChannelSym: Fp8PtpcOnlineLinearMethod,
