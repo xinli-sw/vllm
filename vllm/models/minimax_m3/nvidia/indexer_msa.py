@@ -35,6 +35,7 @@ import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.distributed import get_tensor_model_parallel_rank
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.models.minimax_m3.common.indexer import (
     MiniMaxM3IndexerBackend,
     MiniMaxM3IndexerDecodeMetadata,
@@ -49,9 +50,10 @@ from vllm.models.minimax_m3.nvidia import idxk_shard
 from vllm.models.minimax_m3.nvidia.indexer_decode_cp import get_indexer_decode_cp
 from vllm.models.minimax_m3.nvidia.indexer_kv_split import PrefillKVSplitPlanner
 from vllm.models.minimax_m3.nvidia.indexer_prefill_plan import (
+    _PREFILL_MAX_KV_SPLITS,
     _host_prefill_kv_lens,
     _plan_prefill_segments,
-    _PREFILL_MAX_KV_SPLITS,
+    _prefill_score_variants,
     _segment_page_index,
 )
 from vllm.models.minimax_m3.nvidia.ops import minimax_m3_index_decode_score_cutedsl
@@ -76,6 +78,8 @@ _SCORE_SENTINEL = float("-inf")
 # num_valid_pages bound each row to its causal range, so shorter replays reuse
 # the same buffer safely.
 MAX_K_TILES = 8192
+
+logger = init_logger(__name__)
 
 
 class MiniMaxM3IndexerMSABackend(MiniMaxM3IndexerBackend):
@@ -180,7 +184,31 @@ class MiniMaxM3IndexerMSAMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
         self.use_bounded_prefill_split = (
             vllm_config.attention_config.minimax_m3_indexer_prefill_kv_split
         )
-        self.prefill_num_sms = torch.cuda.get_device_properties(device).multi_processor_count
+        if envs.VLLM_MINIMAX_M3_INDEXER_PREFILL_PRECOMPILE:
+            if not self.use_bounded_prefill_split:
+                raise ValueError(
+                    "Prefill precompile requires the bounded split planner"
+                )
+            from vllm.third_party.fmha_sm100.api import _compute_pack_factor
+            from vllm.third_party.fmha_sm100.jit import (
+                _dlpack_dtype_code,
+                get_fmha_variant,
+            )
+
+            dtype_code = _dlpack_dtype_code(kv_cache_spec.dtype)
+            for variant in _prefill_score_variants(
+                self.num_index_heads, _compute_pack_factor
+            ):
+                get_fmha_variant(dtype_code, *variant)
+        self.prefill_num_sms = torch.cuda.get_device_properties(
+            device
+        ).multi_processor_count
+        logger.info_once(
+            "MiniMax indexer prefill: host_metadata=%s bounded_split=%s precompile=%s",
+            envs.VLLM_MINIMAX_M3_INDEXER_SYNC_FREE_METADATA,
+            self.use_bounded_prefill_split,
+            envs.VLLM_MINIMAX_M3_INDEXER_PREFILL_PRECOMPILE,
+        )
         self.kv_split: PrefillKVSplitPlanner | None = None
         if envs.VLLM_MINIMAX_M3_INDEXER_PREFILL_KV_SPLIT:
             self.kv_split = PrefillKVSplitPlanner(
@@ -269,7 +297,10 @@ class MiniMaxM3IndexerMSAMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
             if sync_free:
                 side_kv = _host_prefill_kv_lens(
                     common_attn_metadata.seq_lens_cpu_upper_bound,
-                    side_qo, lo, hi, self.reorder_batch_threshold,
+                    side_qo,
+                    lo,
+                    hi,
+                    self.reorder_batch_threshold,
                 )
             if side_kv is None:
                 side_kv = seq_lens[lo:hi].cpu().to(torch.int32)
@@ -280,20 +311,31 @@ class MiniMaxM3IndexerMSAMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
                 if num_rows != int(side_qo.sum()):
                     max_splits = 1
                 seg_qo, seg_kv, seg_req, num_kv_splits = _plan_prefill_segments(
-                    side_qo.tolist(), side_kv.tolist(), self.num_index_heads,
-                    self.prefill_num_sms, max_splits,
+                    side_qo.tolist(),
+                    side_kv.tolist(),
+                    self.num_index_heads,
+                    self.prefill_num_sms,
+                    max_splits,
                 )
                 seg_qo_t = torch.tensor(seg_qo, dtype=torch.int32)
                 seg_kv_t = torch.tensor(seg_kv, dtype=torch.int32)
                 plan = _fmha_sm100_plan(
-                    seg_qo_t, seg_kv_t, self.num_index_heads, num_kv_heads=1,
-                    qo_offset=seg_kv_t - seg_qo_t, page_size=PAGE_SIZE,
-                    output_maxscore=True, causal=True, num_kv_splits=num_kv_splits,
+                    seg_qo_t,
+                    seg_kv_t,
+                    self.num_index_heads,
+                    num_kv_heads=1,
+                    qo_offset=seg_kv_t - seg_qo_t,
+                    page_size=PAGE_SIZE,
+                    output_maxscore=True,
+                    causal=True,
+                    num_kv_splits=num_kv_splits,
                 )
                 plan["max_k_tiles"] = max_k_tiles
                 assert max(seg_kv) <= block_table.shape[1] * PAGE_SIZE
                 rows, cols = _segment_page_index(seg_req, seg_kv)
-                index_cpu = torch.empty((2, len(rows)), dtype=torch.int64, pin_memory=True)
+                index_cpu = torch.empty(
+                    (2, len(rows)), dtype=torch.int64, pin_memory=True
+                )
                 index_cpu[0].numpy()[:] = rows
                 index_cpu[1].numpy()[:] = cols
                 index = index_cpu.to(block_table.device, non_blocking=True)
@@ -326,7 +368,9 @@ class MiniMaxM3IndexerMSAMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
                     rows, cols = _segment_page_index(
                         list(range(hi - lo)), side_kv.tolist()
                     )
-                    index_cpu = torch.empty((2, len(rows)), dtype=torch.int64, pin_memory=True)
+                    index_cpu = torch.empty(
+                        (2, len(rows)), dtype=torch.int64, pin_memory=True
+                    )
                     index_cpu[0].numpy()[:] = rows
                     index_cpu[1].numpy()[:] = cols
                     index = index_cpu.to(block_table.device, non_blocking=True)

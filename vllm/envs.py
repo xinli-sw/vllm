@@ -226,6 +226,7 @@ if TYPE_CHECKING:
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
     VLLM_FLASHINFER_MOE_A2A_LOW_PRECISION_COMBINE: bool = False
+    VLLM_MINIMAX_M3_INDEXER_PREFILL_PRECOMPILE: bool = False
     VLLM_MINIMAX_M3_INDEXER_SYNC_FREE_METADATA: bool = False
     VLLM_MINIMAX_M3_INDEXER_PREFILL_KV_SPLIT: bool = True
     VLLM_XGRAMMAR_CACHE_MB: int = 0
@@ -1713,6 +1714,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # split-KV over <=128-token query slices so short prefill chunks over long
     # contexts fill the GPU. The block scores (and top-k) are bit-identical to
     # the unsplit plan. Set to 0 to keep the unsplit plan.
+    "VLLM_MINIMAX_M3_INDEXER_PREFILL_PRECOMPILE": lambda: bool(
+        int(os.getenv("VLLM_MINIMAX_M3_INDEXER_PREFILL_PRECOMPILE", "0"))
+    ),
     "VLLM_MINIMAX_M3_INDEXER_SYNC_FREE_METADATA": lambda: bool(
         int(os.getenv("VLLM_MINIMAX_M3_INDEXER_SYNC_FREE_METADATA", "0"))
     ),

@@ -51,7 +51,6 @@ def _host_prefill_kv_lens(
     return kv_lens
 
 
-
 # Prefill split-KV score (attention_config.minimax_m3_indexer_prefill_kv_split).
 # fmha_sm100 splits the KV walk only on its 128-query tile, so a split plan cuts
 # each request into segments of at most this many queries.
@@ -124,7 +123,6 @@ def _plan_prefill_segments(
     return seg_qo, seg_kv, seg_req, splits
 
 
-
 def _prefill_score_variants(
     num_heads: int, pack_factor_fn: Callable[[int, int, int], int]
 ) -> list[tuple]:
@@ -149,4 +147,3 @@ def _prefill_score_variants(
         if pack > 1:
             variants.add((128, q * pack <= 64, 2, PAGE_SIZE, False, pack))
     return sorted(variants)
-
