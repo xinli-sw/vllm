@@ -48,6 +48,10 @@ from vllm.models.minimax_m3.common.ops.index_topk import (
 from vllm.models.minimax_m3.nvidia import idxk_shard
 from vllm.models.minimax_m3.nvidia.indexer_decode_cp import get_indexer_decode_cp
 from vllm.models.minimax_m3.nvidia.indexer_kv_split import PrefillKVSplitPlanner
+from vllm.models.minimax_m3.nvidia.indexer_prefill_plan import (
+    _host_prefill_kv_lens,
+    _segment_page_index,
+)
 from vllm.models.minimax_m3.nvidia.ops import minimax_m3_index_decode_score_cutedsl
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -247,17 +251,22 @@ class MiniMaxM3IndexerMSAMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
 
         prefill: MiniMaxM3IndexerMSAPrefillMetadata | None = None
         if num_prefills > 0:
-            # Prefill is eager (not captured); the host lengths it needs (and the
-            # _fmha_sm100_plan .tolist() inside) make the D->H sync acceptable.
+            # Host metadata avoids synchronizing the prefill GPU queue.
             from vllm.third_party.fmha_sm100.api import _fmha_sm100_plan
 
             lo, hi = num_decodes, num_reqs
             qsl_cpu = common_attn_metadata.query_start_loc_cpu[: num_reqs + 1]
             qo_lens_cpu = (qsl_cpu[1:] - qsl_cpu[:-1]).to(torch.int32)
-            kv_lens_cpu = seq_lens[:num_reqs].cpu().to(torch.int32)
-            nvp = (kv_lens_cpu + PAGE_SIZE - 1) // PAGE_SIZE
             side_qo = qo_lens_cpu[lo:hi]
-            side_kv = kv_lens_cpu[lo:hi]
+            side_kv = None
+            sync_free = envs.VLLM_MINIMAX_M3_INDEXER_SYNC_FREE_METADATA
+            if sync_free:
+                side_kv = _host_prefill_kv_lens(
+                    common_attn_metadata.seq_lens_cpu_upper_bound,
+                    side_qo, lo, hi, self.reorder_batch_threshold,
+                )
+            if side_kv is None:
+                side_kv = seq_lens[lo:hi].cpu().to(torch.int32)
             split = (
                 None
                 if self.kv_split is None
@@ -283,9 +292,21 @@ class MiniMaxM3IndexerMSAMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
                 # max_k_tiles >= the plan's natural value, so the extra tiles
                 # are simply never written.
                 plan["max_k_tiles"] = max_k_tiles
-                cols = torch.arange(block_table.shape[1], device=block_table.device)
-                valid = cols[None, :] < nvp[lo:hi].to(block_table.device)[:, None]
-                page_table = block_table[lo:hi][valid].to(torch.int32)
+                if sync_free:
+                    assert int(side_kv.max()) <= block_table.shape[1] * PAGE_SIZE
+                    rows, cols = _segment_page_index(
+                        list(range(hi - lo)), side_kv.tolist()
+                    )
+                    index_cpu = torch.empty((2, len(rows)), dtype=torch.int64, pin_memory=True)
+                    index_cpu[0].numpy()[:] = rows
+                    index_cpu[1].numpy()[:] = cols
+                    index = index_cpu.to(block_table.device, non_blocking=True)
+                    page_table = block_table[lo:hi][index[0], index[1]].to(torch.int32)
+                else:
+                    nvp = (side_kv + PAGE_SIZE - 1) // PAGE_SIZE
+                    cols = torch.arange(block_table.shape[1], device=block_table.device)
+                    valid = cols[None, :] < nvp.to(block_table.device)[:, None]
+                    page_table = block_table[lo:hi][valid].to(torch.int32)
             gather_pages = None
             if self.idxk_tp > 1:
                 # Split-KV slices reuse physical pages. Gather each page once
