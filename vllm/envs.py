@@ -277,6 +277,7 @@ if TYPE_CHECKING:
     VLLM_ALLREDUCE_USE_SYMM_MEM: bool = True
     VLLM_ALLREDUCE_USE_FLASHINFER: bool = True
     VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC: bool = False
+    VLLM_USE_FUSED_DRAFT_ARGMAX: bool = False
     VLLM_TUNED_CONFIG_FOLDER: str | None = None
     VLLM_ENABLE_STARTUP_PLAN: bool = False
     VLLM_GPT_OSS_SYSTEM_TOOL_MCP_LABELS: set[str] = set()
@@ -1974,6 +1975,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # integration is being qualified.
     "VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC": lambda: bool(
         int(os.getenv("VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC", "0"))
+    ),
+    # Whether greedy draft heads on the local-argmax path
+    # (speculative_config.use_local_argmax_reduction) use the fused
+    # vocab-parallel lm_head GEMV + argmax kernel (Blackwell, unscaled bf16
+    # heads). Its fp32 accumulation order can differ from the stock GEMM's, so
+    # near-ties may pick a different draft token; opt-in.
+    "VLLM_USE_FUSED_DRAFT_ARGMAX": lambda: bool(
+        int(os.getenv("VLLM_USE_FUSED_DRAFT_ARGMAX", "0"))
     ),
     # Experimental: use this to enable MCP tool calling for non harmony models
     "VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT": lambda: bool(
