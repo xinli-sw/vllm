@@ -2,15 +2,26 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
 import copy
+import json
 import queue
+import re
+import threading
+from array import array
+from collections import OrderedDict
+from collections.abc import Sequence
 from pathlib import Path
-from typing import TypeAlias, TypeVar
+from typing import Any, TypeAlias, TypeVar
 
+import tokenizers
 from transformers import AutoTokenizer, PythonBackend, TokenizersBackend
+from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
+from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_sentence_transformer_tokenizer_config
 
 from .protocol import TokenizerLike
+
+logger = init_logger(__name__)
 
 HfTokenizer: TypeAlias = PythonBackend | TokenizersBackend
 _T = TypeVar("_T", bound=TokenizerLike)
@@ -20,6 +31,212 @@ class ThreadSafeHFTokenizerMixin:
     """Mixin class for thread-safe HF fast tokenizers."""
 
     pass
+
+
+def _has_first_only_metaspace(pre_tokenizer: Any) -> bool:
+    """Whether a serialized pre-tokenizer contains a Metaspace that prepends
+    its replacement only at the start of the whole input."""
+    if isinstance(pre_tokenizer, dict):
+        if (
+            pre_tokenizer.get("type") == "Metaspace"
+            and pre_tokenizer.get("prepend_scheme") == "first"
+        ):
+            return True
+        return any(_has_first_only_metaspace(v) for v in pre_tokenizer.values())
+    if isinstance(pre_tokenizer, list):
+        return any(_has_first_only_metaspace(v) for v in pre_tokenizer)
+    return False
+
+
+class SegmentedPromptEncoder:
+    """Tokenize long prompts piecewise, with a cache of piece token ids.
+
+    A fast tokenizer first splits the raw text at its non-normalized added
+    tokens (leftmost-longest matching), then normalizes, pre-tokenizes and
+    encodes each piece between two added tokens independently of the rest.
+    Splitting the text the same way, encoding the pieces separately and
+    interleaving the added token ids therefore gives exactly the ids of the
+    whole-string ``tokenizer(text, add_special_tokens=False)`` call.
+
+    Chat templates delimit every message with added tokens, so a multi-turn
+    conversation re-sends mostly the same pieces. Misses are encoded through
+    the Rust batch path, and a bounded LRU maps piece text to ids so each
+    turn only encodes what it added.
+
+    Use :meth:`maybe_create`, which returns None for tokenizers whose
+    piecewise encoding is not provably identical to the regular call.
+    """
+
+    # Shorter prompts take the regular tokenizer call.
+    MIN_CHARS = 32 * 1024
+
+    def __init__(
+        self,
+        backend: tokenizers.Tokenizer,
+        added_ids: dict[str, int],
+        cache_bytes: int,
+        copies: int = 1,
+    ) -> None:
+        self._backend = backend
+        self._added_ids = added_ids
+        self._cache_bytes_limit = cache_bytes
+        # Longest first: `re` alternation then matches leftmost-longest like
+        # the tokenizer's Aho-Corasick split. The group keeps the matches.
+        self._pattern = re.compile(
+            "("
+            + "|".join(re.escape(c) for c in sorted(added_ids, key=len, reverse=True))
+            + ")"
+        )
+        # Copying a tokenizer can take most of a second; do it at startup.
+        self._backends: queue.SimpleQueue[tokenizers.Tokenizer] = queue.SimpleQueue()
+        self._backends.put(backend)
+        for _ in range(copies - 1):
+            self._backends.put(copy.deepcopy(backend))
+        self._cache: OrderedDict[str, array] = OrderedDict()
+        self._cache_bytes = 0
+        self._lock = threading.Lock()
+
+    @classmethod
+    def maybe_create(
+        cls,
+        tokenizer: TokenizerLike,
+        cache_bytes: int,
+        copies: int = 1,
+    ) -> "SegmentedPromptEncoder | None":
+        """Return an encoder when piecewise encoding is exact for `tokenizer`.
+
+        `cache_bytes` bounds the approximate size of the cached piece text
+        and ids. `copies` backend tokenizers are made for concurrent callers.
+        """
+        if cache_bytes <= 0 or not isinstance(tokenizer, TokenizersBackend):
+            return None
+        # Skip the thread pool wrapper; the encode path must be the stock one.
+        tok_cls = next(
+            c
+            for c in type(tokenizer).__mro__
+            if not issubclass(c, ThreadSafeHFTokenizerMixin)
+        )
+        if (
+            tok_cls.__call__ is not PreTrainedTokenizerBase.__call__
+            or tok_cls._encode_plus is not TokenizersBackend._encode_plus
+            or hasattr(tok_cls, "_switch_to_input_mode")
+            or tokenizer.split_special_tokens
+        ):
+            return None
+        backend = getattr(tokenizer, "_tokenizer", None)
+        if type(backend) is not tokenizers.Tokenizer:
+            return None
+        # A Metaspace pre-tokenizer with prepend_scheme="first" only prefixes
+        # the piece at offset 0 of the whole input, so encoding the pieces
+        # separately would prefix every one of them.
+        if _has_first_only_metaspace(json.loads(backend.to_str()).get("pre_tokenizer")):
+            return None
+
+        added_ids = dict[str, int]()
+        for token_id, added in backend.get_added_tokens_decoder().items():
+            if added.normalized:
+                # Matched after normalization, within a piece.
+                continue
+            if added.lstrip or added.rstrip or added.single_word:
+                return None
+            if added.content:
+                added_ids[added.content] = token_id
+        if not added_ids:
+            return None
+
+        backend = copy.deepcopy(backend)
+        backend.no_truncation()
+        backend.no_padding()
+        backend.encode_special_tokens = False
+        encoder = cls(backend, added_ids, cache_bytes, copies)
+        if not encoder._self_check(tokenizer):
+            logger.warning(
+                "Piecewise prompt tokenization does not reproduce the ids of "
+                "the regular tokenizer call for this tokenizer; disabling it."
+            )
+            return None
+        return encoder
+
+    def _self_check(self, tokenizer: TokenizerLike) -> bool:
+        """Compare piecewise and regular ids on a probe that puts text,
+        whitespace and digits on both sides of each added token."""
+        filler = [" Hello world", "\n  a1 23 ", "x", " \t", "Done. "]
+        added = sorted(self._added_ids)
+        probe = filler[0] + "".join(
+            content + filler[(i + 1) % len(filler)] for i, content in enumerate(added)
+        )
+        # Adjacent added tokens, with nothing between them.
+        probe += added[0] * 2 + filler[0]
+        expected = tokenizer(probe, add_special_tokens=False)["input_ids"]
+        return list(self._encode(probe)) == list(expected)
+
+    @contextlib.contextmanager
+    def _borrow_backend(self):
+        try:
+            backend = self._backends.get_nowait()
+        except queue.Empty:
+            backend = copy.deepcopy(self._backend)
+        try:
+            yield backend
+        finally:
+            self._backends.put(backend)
+
+    def encode(self, text: str, **kwargs) -> Sequence[int] | None:
+        """Return ``tokenizer(text, **kwargs)["input_ids"]``, or None when the
+        regular tokenizer call should handle the prompt."""
+        if (
+            len(text) < self.MIN_CHARS
+            or kwargs.keys() - {"add_special_tokens", "truncation", "max_length"}
+            or kwargs.get("add_special_tokens", True)
+        ):
+            return None
+        token_ids = self._encode(text)
+        max_length = kwargs.get("max_length") if kwargs.get("truncation") else None
+        if max_length is not None and len(token_ids) > max_length:
+            # Let the tokenizer apply its truncation.
+            return None
+        return token_ids
+
+    def _encode(self, text: str) -> array:
+        # Even indices: text between added tokens; odd indices: added tokens.
+        parts = self._pattern.split(text)
+        pieces = dict.fromkeys(p for p in parts[::2] if p)
+
+        cache = self._cache
+        with self._lock:
+            found = {p: cache[p] for p in pieces if p in cache}
+            for p in found:
+                cache.move_to_end(p)
+        missing = [p for p in pieces if p not in found]
+
+        if missing:
+            with self._borrow_backend() as backend:
+                encode_batch = getattr(
+                    backend, "encode_batch_fast", backend.encode_batch
+                )
+                encodings = encode_batch(missing, add_special_tokens=False)
+            new = {p: array("I", e.ids) for p, e in zip(missing, encodings)}
+            found.update(new)
+            limit = self._cache_bytes_limit
+            with self._lock:
+                for p, ids in new.items():
+                    size = len(p) + ids.itemsize * len(ids)
+                    if p in cache or size > limit:
+                        continue
+                    cache[p] = ids
+                    self._cache_bytes += size
+                while self._cache_bytes > limit:
+                    p, ids = cache.popitem(last=False)
+                    self._cache_bytes -= len(p) + ids.itemsize * len(ids)
+
+        added_ids = self._added_ids
+        token_ids = array("I")
+        for i, part in enumerate(parts):
+            if i % 2:
+                token_ids.append(added_ids[part])
+            elif part:
+                token_ids.extend(found[part])
+        return token_ids
 
 
 def maybe_make_thread_pool(tokenizer: _T, copies: int = 1):
