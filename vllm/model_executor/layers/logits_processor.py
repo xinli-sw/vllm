@@ -16,6 +16,10 @@ from vllm.distributed import (
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+from vllm.model_executor.layers.vocab_parallel_argmax import (
+    fused_vocab_parallel_argmax,
+    supports_fused_argmax,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
     VocabParallelEmbedding,
@@ -208,13 +212,26 @@ class LogitsProcessor(PluggableLayer):
 
         Each TP rank computes local argmax, then only the (value, index) pairs
         are gathered and reduced. Communication: O(batch * 2 * tp_size) vs
-        O(batch * vocab_size).
+        O(batch * vocab_size). With ``VLLM_USE_FUSED_DRAFT_ARGMAX``, an
+        unscaled bf16 head on Blackwell instead runs one fused GEMV + argmax
+        kernel (``vocab_parallel_argmax``).
         """
         if self.scale <= 0.0 and self.scale != 1.0:
             raise ValueError(
                 "The local argmax reduction optimization is not supported for "
                 "non-positive logit scaling factors."
             )
+        if (
+            embedding_bias is None
+            and self.scale == 1.0
+            and self.soft_cap is None
+            and self.head_dtype in (None, hidden_states.dtype)
+            and hidden_states.dim() == 2
+            and supports_fused_argmax(lm_head, hidden_states)
+        ):
+            top_tokens = fused_vocab_parallel_argmax(lm_head, hidden_states)
+            if top_tokens is not None:
+                return top_tokens
         tp_size = lm_head.tp_size
 
         logits = self._apply_head(lm_head, hidden_states, embedding_bias)
