@@ -190,6 +190,9 @@ class QuantizationConfigArgs:
 # CLI shorthands accepted by `--quantization`. Each desugars to a full
 # QuantizationConfigArgs; activation overrides go through quantization_config.
 _ONLINE_SHORTHANDS: dict[str, QuantizationConfigArgs] = {
+    "nvfp4_w4a16": QuantizationConfigArgs(
+        linear=QuantSpec(weight=kNvfp4Static),
+    ),
     "fp8_per_tensor": QuantizationConfigArgs(
         linear=QuantSpec(weight=kFp8StaticTensorSym),
         moe=QuantSpec(weight=kFp8StaticTensorSym),
