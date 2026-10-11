@@ -86,6 +86,7 @@ from vllm.models.minimax_m3.common.sparse_attention import (
     select_main_backend_and_impl_cls,
 )
 from vllm.models.minimax_m3.common.vision_tower import MiniMaxVLVisionModel
+from vllm.models.minimax_m3.nvidia import idxk_shard
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
@@ -439,7 +440,24 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         self.total_idx_heads = sparse_cfg["sparse_num_index_heads"]
         self.num_idx_heads = self.num_kv_heads
         self.idx_head_dim = sparse_cfg["sparse_index_dim"]
-        self.index_q_size = self.num_idx_heads * self.idx_head_dim
+        vllm_config = get_current_vllm_config()
+        # Indexer side-cache dtype, mirroring --kv-cache-dtype for the main
+        # cache (--attention-config '{"indexer_kv_dtype": ...}').
+        self.indexer_kv_dtype = vllm_config.attention_config.resolve_indexer_kv_dtype(
+            "bf16"
+        )
+        # TP-sharded index-K cache (nvidia/idxk_shard.py): every rank then
+        # computes (and scores) all index_q heads; the top-k stays per rank.
+        self.index_k_shard = idxk_shard.resolve_shard(
+            vllm_config,
+            self.total_idx_heads,
+            self.indexer_kv_dtype,
+            sparse_cfg["sparse_topk_blocks"],
+        )
+        self.num_qkv_idx_heads = (
+            self.total_idx_heads if self.index_k_shard > 1 else self.num_idx_heads
+        )
+        self.index_q_size = self.num_qkv_idx_heads * self.idx_head_dim
 
         # Single fused projection: q, k, v, index_q, index_k in one GEMM.
         self.qkv_proj = MinimaxM3QKVParallelLinearWithIndexer(
@@ -452,6 +470,7 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             bias=False,
             quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
+            replicate_index_q=self.index_k_shard > 1,
         )
         # reduce_results=False: the attention all-reduce is fused with the
         # following post_attention_layernorm (GemmaRMSNorm) in the decoder layer
@@ -488,7 +507,6 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         self.index_rotary_emb = self.rotary_emb
 
         # Attention-backend wiring.
-        vllm_config = get_current_vllm_config()
         self.layer_name = f"{prefix}.attn"
         self.kv_cache_dtype = (
             cache_config.cache_dtype if cache_config is not None else "auto"
@@ -502,11 +520,6 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
         set_default_quant_scales(self, register_buffer=True)
         # The fused insert quantizes k/v into NVFP4 pages with these scales.
         self.use_nvfp4_kv = get_kv_quant_mode(self.kv_cache_dtype).is_nvfp4
-        # Indexer side-cache dtype, mirroring --kv-cache-dtype for the main
-        # cache (--attention-config '{"indexer_kv_dtype": ...}').
-        self.indexer_kv_dtype = vllm_config.attention_config.resolve_indexer_kv_dtype(
-            "bf16"
-        )
 
         # Shared top-k buffer: the indexer writes the selected blocks into it and
         # the attend impl reads them back (so nothing crosses the eager break as a
@@ -547,6 +560,7 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             cache_config=cache_config,
             indexer_kv_dtype=self.indexer_kv_dtype,
             topk_indices_buffer=topk_indices_buffer,
+            index_k_shard=self.index_k_shard,
         )
 
         # Register the main K/V cache so the KV-cache manager allocates it.
@@ -611,16 +625,21 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             return qkv.new_zeros((num_tokens, self.hidden_size))
 
         main_slot_mapping = fwd_slot_mapping[self.layer_name]
-        index_slot_mapping = fwd_slot_mapping[self.indexer.index_cache.prefix]
+        index_cache = self.indexer.index_cache
+        index_slot_mapping = fwd_slot_mapping[index_cache.prefix]
         q = qkv.new_empty((num_tokens, self.q_size))
         # With query_fp8, q is emitted only in fp8; the attend dequantizes it
         # into ``q`` for the tokens that run on Triton decode.
         query_fp8 = self._allocate_query_fp8(qkv)
+        if index_cache.tp_shard > 1:
+            # Sharded index-K: insert only this rank's rows.
+            index_md = get_forward_context().attn_metadata[index_cache.prefix]
+            index_slot_mapping = index_md.index_slot_mapping
         # index_q matches the index-K cache dtype (e4m3 for the fp8 score path);
         # the fused kernel emits fp8 directly when this buffer is e4m3.
         index_q = qkv.new_empty(
             (num_tokens, self.index_q_size),
-            dtype=self.indexer.index_cache.dtype,
+            dtype=index_cache.dtype,
         )
         ops.fused_minimax_m3_qknorm_rope_kv_insert(
             qkv,
@@ -634,11 +653,11 @@ class MiniMaxM3SparseAttention(nn.Module, AttentionLayerBase):
             eps,
             self.index_q_norm.weight,
             self.index_k_norm.weight,
-            self.num_idx_heads,
+            self.num_qkv_idx_heads,
             main_slot_mapping,
             index_slot_mapping,
             self.kv_cache,
-            self.indexer.index_cache.kv_cache,
+            index_cache.kv_cache,
             self.kv_cache.size(2),  # paged-cache block size
             q if query_fp8 is None else None,
             index_q,
