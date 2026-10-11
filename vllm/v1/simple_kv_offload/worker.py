@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Worker-side handler for SimpleCPUOffloadConnector."""
 
+from collections import deque
 from typing import TYPE_CHECKING
 
 import torch
@@ -36,6 +37,7 @@ class SimpleCPUOffloadWorker:
         disk_capacity_bytes: int = 0,
         disk_buffer_slots: int = 2,
         use_page_cache: bool = False,
+        host_gated_stores: bool = False,
     ):
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
@@ -44,6 +46,7 @@ class SimpleCPUOffloadWorker:
         self.disk_capacity_bytes = disk_capacity_bytes
         self.disk_buffer_slots = disk_buffer_slots
         self.use_page_cache = use_page_cache
+        self.host_gated_stores = host_gated_stores
         self.disk_mode = kv_offload_backend == "disk"
 
         self.gpu_kv_caches: dict[str, torch.Tensor] | None = None
@@ -68,9 +71,12 @@ class SimpleCPUOffloadWorker:
         # Metadata for the current step
         self._connector_metadata: SimpleCPUOffloadMetadata | None = None
 
-        # Compute-done event recorded before each store; reused across steps
-        # (get_finished runs once per step, copy queue is FIFO).
-        self._store_compute_done: torch.Event | None = None
+        # Compute-done events gating stores, as (store_event, event), oldest
+        # first. The copy thread may still be waiting on (or, with
+        # host_gated_stores, polling) an event after this step ends, so an
+        # event is re-recorded only once its store has completed; re-recording
+        # it earlier would hold that store back to a later step.
+        self._store_compute_done: deque[tuple[int, torch.Event]] = deque()
 
         # Pending event index sets, populated in bind_connector_metadata
         self._pending_load_event_indices: set[int] = set()
@@ -234,7 +240,7 @@ class SimpleCPUOffloadWorker:
                 pin_tensor(tensor)
             self.cpu_kv_caches[name] = tensor
 
-        self._backend = DmaCopyBackend()
+        self._backend = DmaCopyBackend(host_gated_stores=self.host_gated_stores)
         self._backend.init(
             unique_gpu_caches,
             self.cpu_kv_caches,
@@ -282,17 +288,26 @@ class SimpleCPUOffloadWorker:
         if metadata is not None and metadata.store_gpu_blocks:
             backend = self._backend
             assert backend is not None
-            if self._store_compute_done is None:
-                self._store_compute_done = torch.Event()
-            self._store_compute_done.record(torch.cuda.current_stream())
+            compute_done = self._next_store_compute_done(metadata.store_event)
+            compute_done.record(torch.cuda.current_stream())
             backend.launch_copy(
                 metadata.store_gpu_blocks,
                 metadata.store_cpu_blocks,
                 is_store=True,
                 event_idx=metadata.store_event,
                 events_list=self._store_events,
-                wait_event=self._store_compute_done,
+                wait_event=compute_done,
             )
+
+    def _next_store_compute_done(self, store_event: int) -> torch.Event:
+        """Reuse the oldest compute-done event whose store has completed."""
+        events = self._store_compute_done
+        if events and events[0][0] <= self._store_hwm:
+            event = events.popleft()[1]
+        else:
+            event = torch.Event()
+        events.append((store_event, event))
+        return event
 
     def get_finished(
         self, finished_req_ids: set[str]
@@ -348,6 +363,9 @@ class SimpleCPUOffloadWorker:
 
     def _flush_and_sync_all(self) -> None:
         """Synchronize all in-flight transfer events."""
+        # Copies still queued on the copy thread have no event to sync yet.
+        if isinstance(self._backend, DmaCopyBackend):
+            self._backend.wait_idle()
         for event_idx, event in self._load_events:
             event.synchronize()
             self._load_hwm = event_idx
