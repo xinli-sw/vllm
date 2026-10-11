@@ -42,6 +42,23 @@ logger = init_logger(__name__)
 class TrtLlmNvFp4ExpertsBase:
     """NvFp4 TRTLLM-Gen MoE kernels. Supports modular and monolithic interface."""
 
+    @staticmethod
+    def is_supported_config(
+        cls, moe_config, weight_key, activation_key, activation_format
+    ):
+        if moe_config.num_fused_shared_experts:
+            if cls.is_monolithic():
+                return False, "MiniMax shared fusion requires precomputed routing"
+            if moe_config.routing_method != RoutingMethodType.MiniMax2:
+                return False, "experimental shared fusion requires MiniMax routing"
+            if moe_config.moe_parallel_config.use_ep:
+                return False, "experimental shared fusion does not support EP"
+            if moe_config.fused_shared_expert_weight != 1.0:
+                return False, "experimental shared fusion requires unit shared weight"
+        return mk.FusedMoEExperts.is_supported_config(
+            cls, moe_config, weight_key, activation_key, activation_format
+        )
+
     def __init__(
         self,
         moe_config: FusedMoEConfig,
@@ -369,8 +386,8 @@ class TrtLlmNvFp4ExpertsModular(TrtLlmNvFp4ExpertsBase, mk.FusedMoEExpertsModula
             output1_scale_scalar=self.g1_scale_c,
             output1_scale_gate_scalar=output1_scale_gate_scalar,
             output2_scale_scalar=self.quant_config.g2_alphas,
-            num_experts=global_num_experts,
-            top_k=self.topk,
+            num_experts=global_num_experts + self.moe_config.num_fused_shared_experts,
+            top_k=topk_ids.shape[-1],
             n_group=0,
             topk_group=0,
             intermediate_size=self.intermediate_size_per_partition,
@@ -429,7 +446,10 @@ class TrtLlmNvFp4ExpertsModular(TrtLlmNvFp4ExpertsBase, mk.FusedMoEExpertsModula
             # Each launch permutes into its own buffer, so only a run that fits
             # in one launch can leave the top-k reduction to a deferring
             # consumer.
-            defer = self.moe_config.should_defer_moe_finalize(M)
+            defer = (
+                self.moe_config.should_defer_moe_finalize(M)
+                and self.moe_config.num_fused_shared_experts == 0
+            )
             return self._invoke_kernel(
                 None if defer else output,
                 hidden_states,

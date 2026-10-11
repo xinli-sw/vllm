@@ -1293,6 +1293,8 @@ class FusedMoEConfig:
     has_bias: bool = False
     is_lora_enabled: bool = False
     has_hash_routing: bool = False
+    num_fused_shared_experts: int = 0
+    fused_shared_expert_weight: float = 1.0
     shared_expert_prefix: str | None = None
 
     # When True, the MoE skips its final cross-rank all-reduce (and the separate

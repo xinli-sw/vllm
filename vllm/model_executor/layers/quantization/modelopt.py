@@ -861,6 +861,12 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
                     f"{activation_key}. Use quantization_config.moe.activation="
                     "'nvfp4_per_token' or omit the override."
                 )
+        if moe_config.num_fused_shared_experts:
+            if self.use_a16:
+                raise ValueError("Fused shared experts require NVFP4 W4A4 MoE")
+            # Requantized MXFP8 shared weights carry no calibrated activation
+            # scales. Dynamic per-token scaling also applies to routed experts.
+            activation_key = kNvfp4DynamicToken
         self.per_token_activation = activation_key == kNvfp4DynamicToken
 
         self.nvfp4_backend, self.experts_cls = select_nvfp4_moe_backend(
