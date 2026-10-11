@@ -1304,6 +1304,8 @@ class FusedMoEConfig:
     has_hash_routing: bool = False
     # Routes are adjusted between routing and expert execution.
     require_decomposed_backend: bool = False
+    num_fused_shared_experts: int = 0
+    fused_shared_expert_weight: float = 1.0
     shared_expert_prefix: str | None = None
 
     # When True, the MoE skips its final cross-rank all-reduce (and the separate

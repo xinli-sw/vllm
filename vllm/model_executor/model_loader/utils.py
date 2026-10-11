@@ -154,6 +154,11 @@ def process_weights_after_loading(
 
     maybe_retie_word_embeddings(model, model_config)
 
+    # Model-level conversion requiring complete checkpoint weights must precede
+    # per-layer repacking, and must not run in incremental load_weights calls.
+    if hasattr(model, "process_weights_before_quantization"):
+        model.process_weights_before_quantization()
+
     for name, module in model.named_modules():
         quant_method = getattr(module, "quant_method", None)
         if isinstance(quant_method, QuantizeMethodBase):
