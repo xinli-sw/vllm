@@ -1,0 +1,38 @@
+served-model-name: nvidia/MiniMax-M3-NVFP4
+gpu-memory-utilization: 0.95
+block-size: 128
+language-model-only: true
+enable-prefix-caching: true
+enable-chunked-prefill: true
+no-enable-flashinfer-autotune: true
+reasoning-parser: minimax_m3
+tool-call-parser: minimax_m3
+enable-auto-tool-choice: true
+default-chat-template-kwargs:
+  thinking_mode: enabled
+attention-config:
+  backend: FLASHINFER
+  use_trtllm_attention: true
+  indexer_kv_dtype: fp8
+  minimax_m3_index_k_tp_shard: 'on'
+kv-cache-dtype: fp8
+max-cudagraph-capture-size: 288
+max-num-batched-tokens: 16384
+stream-interval: 20
+trust-remote-code: true
+speculative-config:
+  method: eagle3
+  model: Inferact/MiniMax-M3-EAGLE3-GQA
+  num_speculative_tokens: 3
+  attention_backend: FLASHINFER
+  use_local_argmax_reduction: true
+tensor-parallel-size: 4
+max-num-seqs: 72
+kv-transfer-config:
+  kv_connector: SimpleCPUOffloadConnector
+  kv_role: kv_both
+  kv_connector_extra_config:
+    cpu_bytes_to_use: 1082000000000
+    lazy_offload: true
+    host_gated_stores: true
+renderer-tokenize-cache-mb: 256
