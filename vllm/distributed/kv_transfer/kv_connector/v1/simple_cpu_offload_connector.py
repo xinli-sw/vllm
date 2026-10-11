@@ -112,6 +112,9 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             raise ValueError("num_cpu_blocks must be a positive integer")
 
         lazy_offload = bool(extra_config.get("lazy_offload", False))
+        # Opt-in: gate GPU->CPU stores on their compute-done event on the host
+        # instead of with a device-side stream wait (see DmaCopyBackend).
+        host_gated_stores = bool(extra_config.get("host_gated_stores", False))
 
         kv_offload_backend = str(extra_config.get("kv_offload_backend", "cpu"))
         if kv_offload_backend not in VALID_KV_OFFLOAD_BACKENDS:
@@ -206,6 +209,7 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 disk_buffer_slots=disk_buffer_slots,
                 use_page_cache=use_page_cache,
                 num_cpu_blocks=num_cpu_blocks,
+                host_gated_stores=host_gated_stores,
             )
 
     # --- Worker-side methods ---
