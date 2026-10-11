@@ -212,9 +212,8 @@ class LogitsProcessor(PluggableLayer):
 
         Each TP rank computes local argmax, then only the (value, index) pairs
         are gathered and reduced. Communication: O(batch * 2 * tp_size) vs
-        O(batch * vocab_size). With ``VLLM_USE_FUSED_DRAFT_ARGMAX``, an
-        unscaled bf16 head on Blackwell instead runs one fused GEMV + argmax
-        kernel (``vocab_parallel_argmax``).
+        O(batch * vocab_size). Eligible unscaled bf16 heads on Blackwell
+        run one fused GEMV + argmax kernel (``vocab_parallel_argmax``).
         """
         if self.scale <= 0.0 and self.scale != 1.0:
             raise ValueError(

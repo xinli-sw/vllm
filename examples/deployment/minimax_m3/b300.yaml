@@ -14,7 +14,6 @@ attention-config:
   backend: FLASHINFER
   use_trtllm_attention: true
   indexer_kv_dtype: fp8
-  flashinfer_balanced_decode: true
 kv-cache-dtype: fp8
 max-num-batched-tokens: 16384
 stream-interval: 20
@@ -77,3 +76,7 @@ kv-transfer-config:
     lazy_offload: true
     host_gated_stores: true
 renderer-tokenize-cache-mb: 256
+quantization-config:
+  targets:
+    re:.*\.layers\.[0-9]+\.block_sparse_moe\.shared_experts\.(gate_up_proj|gate_proj|up_proj|down_proj)$: nvfp4_w4a16
+moe-backend: flashinfer_trtllm
