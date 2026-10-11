@@ -213,6 +213,8 @@ if TYPE_CHECKING:
     VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT: bool = False
     VLLM_KIMI_K3_AUX_ATTN_RES_STREAM: bool = False
     VLLM_KIMI_K3_GEMM_AR: bool = True
+    VLLM_MINIMAX_M3_SPARSE_DECODE_FP16_DOT: bool = False
+    VLLM_MINIMAX_M3_SPARSE_DECODE_FILL_SMS: bool = False
     VLLM_ENABLE_GEMM_RS: bool = False
     VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER: bool = True
     VLLM_USE_FLASHINFER_MOE_INT4: bool = False
@@ -1653,6 +1655,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Use the SM100 BF16 GEMM-AR kernel for eligible Kimi-K3 row-parallel
     # attention projections. All TP ranks must belong to one NVLink domain.
     "VLLM_KIMI_K3_GEMM_AR": lambda: bool(int(os.getenv("VLLM_KIMI_K3_GEMM_AR", "1"))),
+    # MiniMax-M3 Triton sparse decode (CUDA only), with an fp8 KV cache and no
+    # or scalar KV scales: run the QK and PV dots in fp16 (fp8 -> fp16 is
+    # exact) and fold the scalar K/V scales into the softmax scale and the
+    # output. Not bit-identical to the bf16 path, so off by default.
+    "VLLM_MINIMAX_M3_SPARSE_DECODE_FP16_DOT": lambda: bool(
+        int(os.getenv("VLLM_MINIMAX_M3_SPARSE_DECODE_FP16_DOT", "0"))
+    ),
+    # MiniMax-M3 Triton sparse decode (CUDA only): size the split-K chunk count
+    # to one wave of resident programs on the device instead of a fixed
+    # 256-program target. Changes the split-K reduction, so off by default.
+    "VLLM_MINIMAX_M3_SPARSE_DECODE_FILL_SMS": lambda: bool(
+        int(os.getenv("VLLM_MINIMAX_M3_SPARSE_DECODE_FILL_SMS", "0"))
+    ),
     # Fuse eligible sequence-parallel row-parallel projections with their TP
     # reduce-scatter using the SM100 BF16/MXFP8 GEMM-RS kernel (Kimi-K3
     # attention/shared-expert projections, DeepSeek-V4.1 ``wo_b``). All TP
