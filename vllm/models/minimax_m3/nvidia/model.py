@@ -215,6 +215,9 @@ class MiniMaxM3MoE(nn.Module):
 
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
         self.n_shared_experts = getattr(config, "n_shared_experts", None)
+        from vllm.models.minimax_m3.nvidia.shared_expert_fusion import fusion_enabled
+
+        self.fuse_shared_experts = fusion_enabled(config)
 
         # Sigmoid routing uses a per-expert score-correction bias for selection.
         self.use_routing_bias = getattr(config, "use_routing_bias", False)
@@ -266,7 +269,9 @@ class MiniMaxM3MoE(nn.Module):
             swiglu_beta=config.swiglu_beta,
             routed_scaling_factor=self.routed_scaling_factor,
             router_logits_dtype=self.gate.out_dtype,
-            shared_experts=self.shared_experts,
+            shared_experts=None if self.fuse_shared_experts else self.shared_experts,
+            n_shared_experts=self.n_shared_experts,
+            fuse_shared_experts=self.fuse_shared_experts,
             quant_config=quant_config,
             reduce_results=reduce_results,
             prefix=f"{prefix}.experts",
@@ -1111,6 +1116,17 @@ class MiniMaxM3SparseForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()
 
+    def process_weights_before_quantization(self) -> None:
+        # AutoWeightsLoader can revisit the text backbone across shard groups.
+        # This root-only hook runs after the complete checkpoint has loaded.
+        from vllm.models.minimax_m3.nvidia.shared_expert_fusion import (
+            install_shared_weights,
+        )
+
+        for module in list(self.modules()):
+            if isinstance(module, MiniMaxM3MoE) and module.fuse_shared_experts:
+                install_shared_weights(module)
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)
@@ -1330,6 +1346,17 @@ class MiniMaxM3SparseForConditionalGeneration(
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.language_model.get_expert_mapping()
+
+    def process_weights_before_quantization(self) -> None:
+        # AutoWeightsLoader can revisit the text backbone across shard groups.
+        # This root-only hook runs after the complete checkpoint has loaded.
+        from vllm.models.minimax_m3.nvidia.shared_expert_fusion import (
+            install_shared_weights,
+        )
+
+        for module in list(self.modules()):
+            if isinstance(module, MiniMaxM3MoE) and module.fuse_shared_experts:
+                install_shared_weights(module)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
