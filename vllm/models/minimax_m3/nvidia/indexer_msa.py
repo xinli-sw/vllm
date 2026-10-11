@@ -17,6 +17,11 @@ Decode scores with CuteDSL when the flattened query tile is supported and fall
 back to Triton otherwise, writing into the decode region. Only the top-k is
 shared with prefill.
 
+With a TP-sharded index-K cache (``idxk_shard``, opt-in), ``index_query`` carries
+every index head; decode scores all of them over this rank's token slice and
+max-combines across ranks, and prefill gathers the prefill requests' full pages
+for the stock OnlyScore pass over this rank's heads.
+
 ``fmha_sm100`` imports are function-local so this module is import-safe on
 AMD / non-SM100.
 """
@@ -28,6 +33,7 @@ import torch
 
 import vllm.envs as envs
 from vllm.config import VllmConfig
+from vllm.distributed import get_tensor_model_parallel_rank
 from vllm.forward_context import get_forward_context
 from vllm.models.minimax_m3.common.indexer import (
     MiniMaxM3IndexerBackend,
@@ -39,6 +45,7 @@ from vllm.models.minimax_m3.common.indexer import (
 from vllm.models.minimax_m3.common.ops.index_topk import (
     minimax_m3_index_decode_score,
 )
+from vllm.models.minimax_m3.nvidia import idxk_shard
 from vllm.models.minimax_m3.nvidia.indexer_kv_split import PrefillKVSplitPlanner
 from vllm.models.minimax_m3.nvidia.ops import minimax_m3_index_decode_score_cutedsl
 from vllm.v1.attention.backend import (
@@ -81,6 +88,9 @@ class MiniMaxM3IndexerMSAPrefillMetadata:
     prefix_lens: torch.Tensor  # [num_prefills] int32, context tokens
     max_query_len: int
     page_table: torch.Tensor  # flat physical page indices for the prefill side
+    # Sharded index-K: the prefill requests' pages in request order (int64);
+    # page_table then indexes this list (the gathered full pages).
+    gather_pages: torch.Tensor | None = None
 
 
 @dataclass
@@ -109,6 +119,9 @@ class MiniMaxM3IndexerMSAMetadata(MiniMaxM3IndexerMetadata):
     # Per-token causal page count cdiv(seq_pos+1, PAGE_SIZE), [total_q] int32:
     # drives sparse_topk_select force_end_blocks + -1 out-of-range clamp.
     topk_num_valid_pages: torch.Tensor | None = None
+    # Sharded index-K: slots of this rank's index-K rows (-1 elsewhere), the
+    # fused insert kernel's index slot mapping (stable cudagraph buffer view).
+    index_slot_mapping: torch.Tensor | None = None
 
 
 class MiniMaxM3IndexerMSAMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
@@ -131,6 +144,23 @@ class MiniMaxM3IndexerMSAMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
         # kernel's shape is frozen at capture. Filled with -inf per forward in
         # build(); the valid/padding partition is a per-forward constant, so
         # every layer overwrites the same valid tiles before its own top-k.
+        # TP-sharded index-K cache (encoded in the spec's packed page size).
+        self.idxk_tp = idxk_shard.shard_factor_from_spec(kv_cache_spec)
+        self.idxk_rank = 0
+        self.idxk_slots: torch.Tensor | None = None
+        if self.idxk_tp > 1:
+            self.idxk_rank = get_tensor_model_parallel_rank()
+            max_capture = vllm_config.compilation_config.max_cudagraph_capture_size or 0
+            self.idxk_slots = torch.full(
+                (
+                    max(
+                        vllm_config.scheduler_config.max_num_batched_tokens, max_capture
+                    ),
+                ),
+                -1,
+                dtype=torch.int64,
+                device=device,
+            )
         self.unified_scores_buffer = torch.empty(
             vllm_config.scheduler_config.max_num_batched_tokens,
             self.num_index_heads,
@@ -167,6 +197,16 @@ class MiniMaxM3IndexerMSAMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
         )
         assert num_decodes + num_prefills == num_reqs
         assert num_decode_tokens + num_prefill_tokens == num_tokens
+
+        # Sharded index-K: this rank's insert slots, into the stable buffer.
+        index_slot_mapping = None
+        if self.idxk_slots is not None:
+            index_slot_mapping = idxk_shard.shard_slot_mapping(
+                common_attn_metadata.slot_mapping,
+                self.idxk_rank,
+                self.idxk_tp,
+                self.idxk_slots,
+            )
 
         # Context (prefix) lengths into the stable cudagraph buffer.
         context_lens = self.context_len_buffer[:num_reqs]
@@ -245,6 +285,15 @@ class MiniMaxM3IndexerMSAMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
                 cols = torch.arange(block_table.shape[1], device=block_table.device)
                 valid = cols[None, :] < nvp[lo:hi].to(block_table.device)[:, None]
                 page_table = block_table[lo:hi][valid].to(torch.int32)
+            gather_pages = None
+            if self.idxk_tp > 1:
+                # Split-KV slices reuse physical pages. Gather each page once
+                # and retain the planner's slice order through the inverse map.
+                gather_pages, page_table = torch.unique(
+                    page_table, sorted=True, return_inverse=True
+                )
+                gather_pages = gather_pages.to(torch.int64)
+                page_table = page_table.to(torch.int32)
             prefill = MiniMaxM3IndexerMSAPrefillMetadata(
                 plan=plan,
                 cu_seqlens_q=(query_start_loc[lo : hi + 1] - query_start_loc[lo]).to(
@@ -253,6 +302,7 @@ class MiniMaxM3IndexerMSAMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
                 prefix_lens=context_lens[lo:hi],
                 max_query_len=int(side_qo.max()),
                 page_table=page_table,
+                gather_pages=gather_pages,
             )
 
         return MiniMaxM3IndexerMSAMetadata(
@@ -272,6 +322,7 @@ class MiniMaxM3IndexerMSAMetadataBuilder(MiniMaxM3IndexerMetadataBuilder):
             topk_prefix_lens=context_lens,
             topk_max_query_len=common_attn_metadata.max_query_len,
             topk_num_valid_pages=num_valid_pages,
+            index_slot_mapping=index_slot_mapping,
         )
 
 
@@ -279,6 +330,17 @@ class MiniMaxM3IndexerMSAImpl(MiniMaxM3IndexerImpl):
     """Decode: CuteDSL/Triton score. Prefill: fmha_sm100 OnlyScore + top-k."""
 
     indexer_backend_cls: ClassVar[type[AttentionBackend]] = MiniMaxM3IndexerMSABackend
+    supports_index_k_shard: ClassVar[bool] = True
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.idxk_ordinal = -1
+        self.idxk_rank = 0
+        if self.index_cache.tp_shard > 1:
+            comm = idxk_shard.get_comm()
+            assert comm is not None
+            self.idxk_ordinal = comm.register_layer()
+            self.idxk_rank = comm.rank
 
     def forward(
         self,
@@ -292,9 +354,9 @@ class MiniMaxM3IndexerMSAImpl(MiniMaxM3IndexerImpl):
 
         num_tokens = md.num_actual_tokens
         nd = md.num_decode_tokens
-        index_q = index_query[:num_tokens].view(
-            -1, self.num_index_heads, self.index_head_dim
-        )
+        sharded = self.index_cache.tp_shard > 1
+        # Sharded: every index head (this rank's are [rank * H, (rank + 1) * H)).
+        index_q = index_query[:num_tokens].view(num_tokens, -1, self.index_head_dim)
         kv = self.index_cache.kv_cache
         # Shared persistent top-k output buffer; the unified top-k below writes
         # the selected block ids into buf[:num_tokens].
@@ -317,36 +379,58 @@ class MiniMaxM3IndexerMSAImpl(MiniMaxM3IndexerImpl):
             d = md.decode
             # max_decode_query_len avoids recompiles across runtime decode sizes.
             # Fall back when the flattened Q tile gets too wide for this kernel.
-            decode_score = (
-                minimax_m3_index_decode_score_cutedsl
-                if self.num_index_heads * d.max_decode_query_len <= 32
-                else minimax_m3_index_decode_score
-            )
-            decode_score(
-                index_q[:nd],
-                kv,
-                d.block_table,
-                d.seq_lens,
-                d.max_seq_len,
-                self.init_blocks,
-                self.local_blocks,
-                self.num_kv_heads,
-                d.decode_query_len,
-                d.max_decode_query_len,
-                score_out=unified_scores[:nd].transpose(0, 1),
-            )
+            if sharded:
+                # Every head over this rank's token slice, then a cross-rank
+                # max of the per-block partial maxima (exact).
+                idxk_shard.decode_score(
+                    index_q[:nd],
+                    kv,
+                    d.block_table,
+                    d.seq_lens,
+                    d.decode_query_len,
+                    d.max_decode_query_len,
+                    unified_scores[:nd],
+                    self.idxk_ordinal,
+                )
+            else:
+                decode_score = (
+                    minimax_m3_index_decode_score_cutedsl
+                    if self.num_index_heads * d.max_decode_query_len <= 32
+                    else minimax_m3_index_decode_score
+                )
+                decode_score(
+                    index_q[:nd],
+                    kv,
+                    d.block_table,
+                    d.seq_lens,
+                    d.max_seq_len,
+                    self.init_blocks,
+                    self.local_blocks,
+                    self.num_kv_heads,
+                    d.decode_query_len,
+                    d.max_decode_query_len,
+                    score_out=unified_scores[:nd].transpose(0, 1),
+                )
 
         if md.prefill_msa is not None:
             from vllm.third_party.fmha_sm100.api import _fmha_sm100
 
             p = md.prefill_msa
+            prefill_q = index_q[nd:]
+            if p.gather_pages is not None:
+                # Sharded index-K: full pages of the prefill requests, scored
+                # for this rank's heads only.
+                kv = idxk_shard.gather_prefill_pages(kv, p.gather_pages)
+                h = self.num_index_heads
+                prefill_q = prefill_q[:, self.idxk_rank * h : (self.idxk_rank + 1) * h]
+                prefill_q = prefill_q.contiguous()
             # Index-K cache (num_blocks, 128, D) -> paged MQA (num_blocks,1,128,D).
             k_pages = kv.view(kv.shape[0], 1, PAGE_SIZE, self.index_head_dim)
             # fmha writes its max_score natively as [nnz_p, H, max_k_tiles] into
             # the prefill region (stride-aware; plan max_k_tiles forced to
             # md.max_k_tiles so the shape matches exactly -> no copy).
             _fmha_sm100(
-                index_q[nd:],
+                prefill_q,
                 k_pages,
                 k_pages,  # V placeholder; not read in OnlyScore
                 p.plan,
