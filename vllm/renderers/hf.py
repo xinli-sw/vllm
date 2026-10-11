@@ -45,7 +45,11 @@ from vllm.renderers.chat_utils import (
     parse_chat_messages,
     parse_chat_messages_async,
 )
-from vllm.tokenizers.hf import HfTokenizer, maybe_make_thread_pool
+from vllm.tokenizers.hf import (
+    HfTokenizer,
+    SegmentedPromptEncoder,
+    maybe_make_thread_pool,
+)
 from vllm.transformers_utils.chat_templates import get_chat_template_fallback_path
 from vllm.transformers_utils.processor import cached_get_processor
 from vllm.utils.async_utils import make_async
@@ -58,7 +62,12 @@ if TYPE_CHECKING:
     from collections.abc import Set
 
     from vllm.config import ModelConfig, VllmConfig
-    from vllm.inputs import MultiModalDataDict, MultiModalUUIDDict, TokensPrompt
+    from vllm.inputs import (
+        MultiModalDataDict,
+        MultiModalUUIDDict,
+        TextPrompt,
+        TokensPrompt,
+    )
     from vllm.inputs.engine import TokensInput
     from vllm.multimodal.processing.processor import (
         MultiModalPromptUpdates,
@@ -72,7 +81,7 @@ if TYPE_CHECKING:
     )
 
     from .inputs import DictPrompt
-    from .params import ChatParams
+    from .params import ChatParams, TokenizeParams
 
 logger = init_logger(__name__)
 
@@ -970,6 +979,33 @@ class HfRenderer(BaseRenderer[HfTokenizer]):
                 self.tokenizer, config.model_config.renderer_num_workers + 1
             )
 
+        self._segmented_encoder: SegmentedPromptEncoder | None = None
+        cache_mb = getattr(config.model_config, "renderer_tokenize_cache_mb", 0)
+        # Prompt embeds add a placeholder token that the piecewise split does
+        # not account for.
+        if (
+            cache_mb > 0
+            and self.tokenizer is not None
+            and not getattr(config.model_config, "enable_prompt_embeds", False)
+        ):
+            self._segmented_encoder = SegmentedPromptEncoder.maybe_create(
+                self.tokenizer,
+                cache_bytes=cache_mb << 20,
+                copies=config.model_config.renderer_num_workers,
+            )
+            if self._segmented_encoder is None:
+                logger.info(
+                    "Piecewise prompt tokenization is not supported for this "
+                    "tokenizer; --renderer-tokenize-cache-mb has no effect."
+                )
+            else:
+                logger.info(
+                    "Tokenizing prompts of %d+ characters piecewise at added "
+                    "tokens, with a %d MiB piece cache.",
+                    SegmentedPromptEncoder.MIN_CHARS,
+                    cache_mb,
+                )
+
     def _replace_executor(self) -> None:
         """Replace the inner render pool after a stuck worker.
 
@@ -1011,6 +1047,19 @@ class HfRenderer(BaseRenderer[HfTokenizer]):
     def _can_produce_offsets(self) -> bool:
         # Only fast tokenizers expose offset_mapping.
         return self.tokenizer is not None and self.tokenizer.is_fast
+
+    def _tokenize_prompt(
+        self,
+        prompt: TextPrompt,
+        params: TokenizeParams,
+    ) -> TokensPrompt:
+        encoder = self._segmented_encoder
+        if encoder is not None and not self._wants_offsets(prompt, params):
+            token_ids = encoder.encode(prompt["prompt"], **params.get_encode_kwargs())
+            if token_ids is not None:
+                return self._build_tokens_prompt(token_ids, prompt)
+
+        return super()._tokenize_prompt(prompt, params)
 
     def render_messages(
         self,

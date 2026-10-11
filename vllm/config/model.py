@@ -415,6 +415,18 @@ class ModelConfig:
     The offline `LLM` entrypoint uses the synchronous renderer path and
     processes prompts (including multimodal preprocessing) serially, so
     this setting has no effect there."""
+    renderer_tokenize_cache_mb: int = Field(default=0, ge=0)
+    """Size in MiB of a cache of token ids for prompt pieces between added
+    tokens. When positive, the HF renderer tokenizes text prompts of 32k or
+    more characters piecewise: it splits the text at the tokenizer's added
+    tokens the way the fast tokenizer does, encodes only the pieces missing
+    from the cache, and interleaves the added token ids. The token ids are
+    identical to the regular tokenizer call. Chat templates delimit messages
+    with added tokens, so multi-turn conversations with long shared prefixes
+    re-tokenize only their new messages. Tokenizers for which the piecewise
+    encoding cannot be shown to be exact, and requests that add special
+    tokens or return offsets, use the regular tokenizer call. 0 (the default)
+    disables piecewise tokenization."""
 
     # Pooler config
     pooler_config: PoolerConfig | None = None
@@ -484,6 +496,7 @@ class ModelConfig:
             "hf_overrides",
             "logits_processors",
             "io_processor_plugin",
+            "renderer_tokenize_cache_mb",
             "pooler_config",
             "multimodal_config",
             "limit_mm_per_prompt",

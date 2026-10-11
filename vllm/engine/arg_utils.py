@@ -676,6 +676,7 @@ class EngineArgs:
     )
     io_processor_plugin: str | None = None
     renderer_num_workers: int = 1
+    renderer_tokenize_cache_mb: int = ModelConfig.renderer_tokenize_cache_mb
     skip_mm_profiling: bool = MultiModalConfig.skip_mm_profiling
     video_pruning_rate: float | None = MultiModalConfig.video_pruning_rate
     video_pruning_method: str = MultiModalConfig.video_pruning_method
@@ -1058,6 +1059,10 @@ class EngineArgs:
         model_group.add_argument(
             "--renderer-num-workers",
             **model_kwargs["renderer_num_workers"],
+        )
+        model_group.add_argument(
+            "--renderer-tokenize-cache-mb",
+            **model_kwargs["renderer_tokenize_cache_mb"],
         )
 
         # Model loading arguments
@@ -2044,6 +2049,7 @@ class EngineArgs:
             mm_processor_device=self.mm_processor_device,
             io_processor_plugin=self.io_processor_plugin,
             renderer_num_workers=self.renderer_num_workers,
+            renderer_tokenize_cache_mb=self.renderer_tokenize_cache_mb,
         )
 
     def validate_tensorizer_args(self):
