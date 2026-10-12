@@ -38,7 +38,7 @@ from vllm.distributed.aux_output_connector.worker import (
     AuxOutputWorkerConnector,
     get_aux_output_connector,
 )
-from vllm.distributed.parallel_state import get_dcp_group, get_pp_group
+from vllm.distributed.parallel_state import get_dcp_group, get_pp_group, get_tp_group
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
@@ -1117,7 +1117,43 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             elapsed_time,
             cuda_graph_size / (1 << 30),
         )
+        if (
+            capture_decoder
+            and not profile_only
+            and self.compilation_config.cudagraph_warm_replay
+        ):
+            self._warm_replay_cudagraphs()
         return cuda_graph_size
+
+    def _warm_replay_cudagraphs(self) -> None:
+        """Replay every captured target and draft graph once before serving.
+
+        Capture never executes a FULL graph or the graph segments of a
+        PIECEWISE graph, so the one-time device work of each graph's first
+        execution would otherwise land on its first replay under live traffic,
+        with KV-offload copies in flight and the ranks out of lockstep. Run it
+        here instead, with the KV connector idle, then synchronize the device
+        and the TP group. Enabled by `compilation_config.cudagraph_warm_replay`.
+        """
+        assert self.cudagraph_manager is not None
+        start_time = time.perf_counter()
+        with self.maybe_setup_dummy_loras(self.lora_config):
+            target = self.cudagraph_manager.warm_replay()
+            draft = (0, 0)
+            if self.speculator is not None:
+                with use_workspace_lane(self._draft_workspace_lane):
+                    draft = self.speculator.warm_replay()
+        torch.accelerator.synchronize()
+        get_tp_group().barrier()
+        logger.info(
+            "Warm-replayed %d of %d captured CUDA graphs (target %d/%d, "
+            "drafter %d/%d) in %.1f secs",
+            target[0] + draft[0],
+            target[1] + draft[1],
+            *target,
+            *draft,
+            time.perf_counter() - start_time,
+        )
 
     def _remove_request(self, req_id: str) -> bool:
         # Call model_state.remove_request *before* req_states.remove_request
