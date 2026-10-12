@@ -38,7 +38,6 @@ from vllm.v1.core.encoder_cache_manager import (
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks, KVCacheManager
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import KVCacheBlock
-from vllm.v1.core.sched.admission_batching import AdmissionBatcher
 from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
 from vllm.v1.core.sched.output import (
     CachedRequestData,
@@ -135,13 +134,6 @@ class Scheduler(SchedulerInterface):
             if self.scheduler_config.max_num_active_seqs is not None
             else self.max_num_running_reqs
         )
-        # Optional grouping of admissions under that cap; None keeps stock
-        # admission.
-        self.admission_batcher = AdmissionBatcher.from_scheduler_config(
-            self.scheduler_config
-        )
-        if self.admission_batcher is not None:
-            logger.info("Admission batching enabled: %s", self.admission_batcher)
         self.max_num_scheduled_tokens = (
             self.scheduler_config.max_num_scheduled_tokens
             if self.scheduler_config.max_num_scheduled_tokens is not None
@@ -895,20 +887,6 @@ class Scheduler(SchedulerInterface):
 
         # Next, schedule the WAITING requests.
         if not preempted_reqs and self._pause_state != PauseState.PAUSED_ALL:
-            admission_limit = self.max_num_active_reqs
-            if self.admission_batcher is not None:
-                admission_limit = self.admission_batcher.admission_limit(
-                    step=self.current_step,
-                    num_active=len(self.running) + self.num_waiting_for_streaming_input,
-                    max_active=self.max_num_active_reqs,
-                    max_running=self.max_num_running_reqs,
-                    num_waiting=len(self.waiting),
-                    can_group=(self._pause_state == PauseState.UNPAUSED
-                               and not self.kv_holding_waiting
-                               and not self.deferred_waiting),
-                    stalls_decodes=bool(scheduled_running_reqs)
-                    and not prefill_scheduled,
-                )
             step_skipped_waiting: deque[Request] = deque()
             step_skipped_kv_holding: deque[Request] = deque()
 
@@ -931,7 +909,7 @@ class Scheduler(SchedulerInterface):
                 # Paused streaming sessions (WAITING_FOR_STREAMING_REQ) are not
                 # in `running` but still hold a model-runner request slot.
                 num_running = len(self.running) + self.num_waiting_for_streaming_input
-                if num_running >= admission_limit:
+                if num_running >= self.max_num_active_reqs:
                     break
 
                 request = request_queue.peek_request()

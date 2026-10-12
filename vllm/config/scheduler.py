@@ -76,33 +76,6 @@ class SchedulerConfig:
     be ``<= max_num_seqs``. ``None`` (default) keeps current behavior.
     """
 
-    admission_batch_size: int = Field(default=1, ge=1)
-    """Number of WAITING requests to admit together under
-    ``max_num_active_seqs``. ``1`` (default) disables admission batching.
-
-    With a saturated ``max_num_active_seqs`` cap, each finished request frees
-    one slot and the next step admits a single waiting request, whose prefill
-    turns an otherwise pure decode step into a mixed step that stalls every
-    running decode. With a value ``N >= 2``, when fewer than ``N`` slots are
-    free, at least ``N`` fresh requests are waiting, and the step would
-    otherwise be a pure decode step, the scheduler holds the free slots for
-    up to ``admission_batch_max_wait_steps`` steps so that one mixed step
-    carries several prefills. In every other state admission is unchanged.
-    Requires ``max_num_active_seqs`` and must be ``<= max_num_active_seqs``.
-    """
-
-    admission_batch_max_wait_steps: int = Field(default=32, ge=0)
-    """Longest time, in scheduler steps, that free slots are held empty while
-    waiting for ``admission_batch_size`` slots to free. Only used when
-    ``admission_batch_size > 1``."""
-
-    admission_batch_overshoot: bool = True
-    """When an admission-batching hold expires, admit
-    ``admission_batch_size`` requests anyway, exceeding
-    ``max_num_active_seqs`` by up to ``admission_batch_size - 1`` (never
-    ``max_num_seqs``) until enough requests finish. If False, admit only what
-    fits under the cap. Only used when ``admission_batch_size > 1``."""
-
     long_prefill_token_threshold: int = Field(default=0, ge=0)
     """For chunked prefill, a request is considered long if the prompt is
     longer than this number of tokens. 0 disables the cap (default).
@@ -367,18 +340,6 @@ class SchedulerConfig:
                 f"max_num_active_seqs ({self.max_num_active_seqs}) cannot be "
                 f"greater than max_num_seqs ({self.max_num_seqs})."
             )
-
-        if self.admission_batch_size > 1:
-            if self.max_num_active_seqs is None:
-                raise ValueError(
-                    "admission_batch_size > 1 requires max_num_active_seqs to be set."
-                )
-            if self.admission_batch_size > self.max_num_active_seqs:
-                raise ValueError(
-                    f"admission_batch_size ({self.admission_batch_size}) cannot "
-                    "be greater than max_num_active_seqs "
-                    f"({self.max_num_active_seqs})."
-                )
 
         if self.max_num_batched_tokens > self.max_num_seqs * max_model_len:
             logger.warning(
