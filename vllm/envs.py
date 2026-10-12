@@ -217,6 +217,7 @@ if TYPE_CHECKING:
     VLLM_KIMI_K3_AUX_ATTN_RES_STREAM: bool = False
     VLLM_KIMI_K3_GEMM_AR: bool = True
     VLLM_MINIMAX_M3_SPARSE_DECODE_FP16_DOT: bool = False
+    VLLM_MINIMAX_M3_ROUTER_BF16: bool = False
     VLLM_ENABLE_GEMM_RS: bool = False
     VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER: bool = True
     VLLM_USE_FLASHINFER_MOE_INT4: bool = False
@@ -1679,6 +1680,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # or scalar KV scales: run the QK and PV dots in fp16 (fp8 -> fp16 is
     # exact) and fold the scalar K/V scales into the softmax scale and the
     # output. Not bit-identical to the bf16 path, so off by default.
+    "VLLM_MINIMAX_M3_ROUTER_BF16": lambda: bool(
+        int(os.getenv("VLLM_MINIMAX_M3_ROUTER_BF16", "0"))
+    ),
     "VLLM_MINIMAX_M3_SPARSE_DECODE_FP16_DOT": lambda: bool(
         int(os.getenv("VLLM_MINIMAX_M3_SPARSE_DECODE_FP16_DOT", "0"))
     ),
