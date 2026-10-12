@@ -161,6 +161,24 @@ class TargetDependentARSpeculator(DraftModelSpeculator):
         )
         self.on_multi_step_decode_end(self.max_num_reqs)
 
+    def warm_replay(self) -> tuple[int, int]:
+        # Same index reset and hooks as capture(), so the replays read the
+        # buffer state the graphs were captured with.
+        self.last_token_indices.zero_()
+        self.idx_mapping.zero_()
+        assert self.prefill_cudagraph_manager is not None
+        self.on_prefill_begin(self.max_num_reqs)
+        replayed, captured = self.prefill_cudagraph_manager.warm_replay()
+        self.on_prefill_end(self.max_num_reqs)
+        if self.num_speculative_steps == 1:
+            return replayed, captured
+
+        assert self.decode_cudagraph_manager is not None
+        self.on_multi_step_decode_begin(self.max_num_reqs)
+        decode_replayed, decode_captured = self.decode_cudagraph_manager.warm_replay()
+        self.on_multi_step_decode_end(self.max_num_reqs)
+        return replayed + decode_replayed, captured + decode_captured
+
     @torch.inference_mode()
     def propose(
         self,

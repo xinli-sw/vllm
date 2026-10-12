@@ -660,6 +660,19 @@ class CompilationConfig:
     internally managed buffer. Default is False.
     Note that this flag is only effective when cudagraph_mode is PIECEWISE.
     """
+    cudagraph_warm_replay: bool = False
+    """Replay every captured CUDA graph once at the end of startup capture.
+    Only used by the V2 GPU model runner.
+
+    Capture records FULL graphs, and the graph segments of PIECEWISE graphs,
+    without executing them, so the one-time device work of a graph's first
+    execution otherwise happens on its first replay while serving, with the
+    ranks no longer in lockstep. When enabled, each rank replays its graphs in
+    capture order on their capture-time dummy inputs, synchronizing the device
+    after every graph, and the tensor-parallel group then synchronizes before
+    serving. Outputs and graph memory are unchanged; startup grows by one
+    replay per graph. Microbatched (DBO) graphs and the graphs of speculators
+    other than the autoregressive (EAGLE/MTP) drafters are not replayed."""
     cudagraph_specialize_lora: bool = True
     """Whether to create separate cuda graphs for cases with and without active
     LoRA adapters. When set to False, the LoRA-enabled cuda graph will be used
@@ -809,6 +822,7 @@ class CompilationConfig:
             "enabled_custom_ops",
             "disabled_custom_ops",
             "static_forward_context",
+            "cudagraph_warm_replay",
             "pass_config",  # handled separately below
             "dynamic_shapes_config",  # handled separately below
         }
