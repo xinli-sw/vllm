@@ -19,6 +19,7 @@ from torch import nn
 from transformers import PreTrainedConfig
 
 from vllm import _custom_ops as ops
+from vllm import envs
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
@@ -231,13 +232,15 @@ class MiniMaxM3MoE(nn.Module):
         else:
             self.e_score_correction_bias = None
 
-        # Router weights are stored in fp32; GateLinear upcasts the bf16
-        # activations and computes the gate in fp32 (fp32 router logits).
+        # Keep routing logits in FP32 with either router GEMM precision.
+        router_dtype = (
+            torch.bfloat16 if envs.VLLM_MINIMAX_M3_ROUTER_BF16 else torch.float32
+        )
         self.gate = GateLinear(
             config.hidden_size,
             config.num_local_experts,
             bias=False,
-            params_dtype=torch.float32,
+            params_dtype=router_dtype,
             out_dtype=torch.float32,
             prefix=f"{prefix}.gate",
         )
@@ -286,7 +289,7 @@ class MiniMaxM3MoE(nn.Module):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        # router_logits: (num_tokens, n_experts); GateLinear casts to fp32.
+        # router_logits: (num_tokens, n_experts), returned in FP32.
         router_logits, _ = self.gate(hidden_states)
         final_hidden_states = self.experts(
             hidden_states=hidden_states, router_logits=router_logits
