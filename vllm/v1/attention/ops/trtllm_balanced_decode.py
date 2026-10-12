@@ -329,7 +329,10 @@ class TrtllmBalancedDecode:
     def max_chunk_pages(self, num_reqs: int) -> int:
         budget = max(self.target_chunks - num_reqs, 1)
         cap = triton.cdiv(num_reqs * self.max_pages_per_req, budget)
-        return max(self.min_chunk_pages, cap)
+        # A virtual row belongs to one request, so it can never contain more
+        # pages than that request. At large batches the split budget reaches
+        # one; leaving cap unbounded multiplies table width by the batch size.
+        return min(self.max_pages_per_req, max(self.min_chunk_pages, cap))
 
     def supports(
         self, num_reqs: int, q_len: int, num_heads: int, head_dim: int, page_size: int
