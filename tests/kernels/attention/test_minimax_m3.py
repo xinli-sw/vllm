@@ -1446,14 +1446,25 @@ def test_decode_index_topk_fp8(num_idx_heads: int):
     reason="CuteDSL index decode score requires Blackwell.",
 )
 @pytest.mark.parametrize(
-    ("dtype", "decode_query_len", "max_decode_query_len", "concurrent_writes"),
+    (
+        "dtype",
+        "decode_query_len",
+        "max_decode_query_len",
+        "concurrent_writes",
+        "sharded",
+    ),
     [
-        (torch.bfloat16, 1, 1, False),
-        (torch.bfloat16, 3, 8, False),
-        (torch.float8_e4m3fn, 1, 1, False),
-        (torch.float8_e4m3fn, 3, 8, False),
-        (torch.float8_e4m3fn, 8, 8, False),
-        pytest.param(torch.float8_e4m3fn, 1, 1, True, id="concurrent-writes"),
+        (torch.bfloat16, 1, 1, False, False),
+        (torch.bfloat16, 3, 8, False, False),
+        (torch.float8_e4m3fn, 1, 1, False, False),
+        (torch.float8_e4m3fn, 3, 8, False, False),
+        (torch.float8_e4m3fn, 8, 8, False, False),
+        pytest.param(torch.float8_e4m3fn, 1, 1, True, False, id="concurrent-writes"),
+        pytest.param(
+            torch.float8_e4m3fn, 1, 1, True, True, id="sharded-concurrent-writes"
+        ),
+        pytest.param(torch.float8_e4m3fn, 3, 8, False, True, id="sharded-padded-draft"),
+        pytest.param(torch.float8_e4m3fn, 8, 8, False, True, id="sharded-full-draft"),
     ],
 )
 def test_decode_index_score_cutedsl_correctness(
@@ -1461,6 +1472,7 @@ def test_decode_index_score_cutedsl_correctness(
     decode_query_len: int,
     max_decode_query_len: int,
     concurrent_writes: bool,
+    sharded: bool,
 ):
     pytest.importorskip("cutlass")
     from vllm.models.minimax_m3.nvidia.ops import (
@@ -1507,6 +1519,45 @@ def test_decode_index_score_cutedsl_correctness(
         max_decode_query_len=max_decode_query_len,
         score_out=score,
     )
+    if sharded:
+        from vllm.models.minimax_m3.nvidia.ops.index_decode_score_shard import (
+            MAX_K_TILES,
+            SUPPORTED_TP,
+            minimax_m3_index_decode_score_shard_cutedsl,
+        )
+
+        # Local receive buffers isolate the score kernel's stage-reuse ordering.
+        shards = [
+            index_kv_cache[:, rank::SUPPORTED_TP].contiguous()
+            for rank in range(SUPPORTED_TP)
+        ]
+        recv = torch.full(
+            (SUPPORTED_TP, 1, SUPPORTED_TP, 1, total_q, MAX_K_TILES),
+            -float("inf"),
+            device="cuda",
+            dtype=torch.float32,
+        )
+        bases = torch.tensor(
+            [buffer.data_ptr() for buffer in recv], device="cuda", dtype=torch.int64
+        )
+
+        def launch():
+            for rank, shard in enumerate(shards):
+                minimax_m3_index_decode_score_shard_cutedsl(
+                    idx_q,
+                    shard,
+                    block_table,
+                    active_seq_lens,
+                    rank,
+                    decode_query_len,
+                    max_decode_query_len,
+                    bases,
+                    0,
+                    total_q,
+                )
+            merged = recv[:, 0].amax(dim=1).reshape(num_idx_heads, total_q, MAX_K_TILES)
+            score.copy_(merged[..., :score_block_stride])
+
     launch()
     expected = _reference_decode_index_score(
         idx_q,

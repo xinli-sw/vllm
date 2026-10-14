@@ -327,6 +327,7 @@ class IndexDecodeScoreShardKernel:
                 cute.arch.barrier(barrier_id=self.BAR_MMA, number_of_threads=128)
                 for q in cutlass.range_constexpr(Q_TILES):
                     cute.copy(ldsm_atom, sQ_ldsm[None, (q, None)], rQ[None, None, q])
+                cute.arch.fence_proxy("async.shared", space="cta")
                 cute.arch.mbarrier_arrive(tma_empty_mbar)
 
                 tma_stage = 1 % self.num_stages
@@ -370,6 +371,7 @@ class IndexDecodeScoreShardKernel:
                                     rC[None, m, n],
                                 )
 
+                    cute.arch.fence_proxy("async.shared", space="cta")
                     cute.arch.mbarrier_arrive(tma_empty_mbar + tma_stage)
 
                     tile = super_id * PAGES + warp_id
