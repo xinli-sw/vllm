@@ -187,14 +187,12 @@ def _vocab_parallel_argmax_kernel(
         if EXCHANGE:
             slot = (epoch % 2) * WORLD * ROWS
             mask = (src[:, None] < WORLD) & m_mask[None, :]
-            # Push this rank's keys to every peer at once. The payload is the
-            # flag, so no fence is needed: a slot set is rewritten only after
-            # its reader's kernel that reset it has completed (see above).
+            # Release orders prior slot consumption before publishing new keys.
             tl.atomic_xchg(
                 bases[:, None] + slot + RANK * ROWS + offs_m[None, :],
                 tl.broadcast_to(local[None, :], [WORLD, M_PAD]),
                 mask=mask,
-                sem="relaxed",
+                sem="release",
                 scope="sys",
             )
             own = tl.load(recv_ptrs + RANK).to(tl.pointer_type(tl.int64))
@@ -214,8 +212,15 @@ def _vocab_parallel_argmax_kernel(
                     is_pure=False,
                     pack=1,
                 )
+            # Consume and clear each payload atomically before publishing again.
+            keys = tl.atomic_xchg(
+                ptrs,
+                tl.zeros([WORLD, M_PAD], dtype=tl.int64),
+                mask=mask,
+                sem="acq_rel",
+                scope="sys",
+            )
             local = tl.max(tl.where(mask, keys, 0), axis=0)
-            tl.store(ptrs, tl.zeros([WORLD, M_PAD], dtype=tl.int64), mask=mask)
             tl.store(epoch_ptr, epoch + 1)
             tl.store(out_ptr + offs_m, _key_token_ids(local), mask=m_mask)
         elif WORLD == 1:
@@ -277,7 +282,7 @@ class _ArgmaxState:
         bases = [int(p) for p in handle.buffer_ptrs]
         assert bases[self.rank] == recv.data_ptr()
         self.peer_ptrs = torch.tensor(bases, dtype=torch.int64, device=self.device)
-        torch.cuda.synchronize(self.device)
+        torch.accelerator.synchronize(self.device)
         handle.barrier()
         self.recv, self.handle = recv, handle
 
@@ -432,6 +437,7 @@ def fused_vocab_parallel_argmax(
     # that can hold the argmax (large shards); this kernel otherwise.
     if vocab_parallel_screen.try_launch(lm_head, hidden_states, out):
         comm = vocab_parallel_screen._COMM
+        assert comm is not None
         exchanged = comm.world == 1 or comm.exchange
     else:
         launch(

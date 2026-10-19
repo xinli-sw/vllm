@@ -311,7 +311,7 @@ def _screen_kernel(
                 bases[:, None] + tslot + RANK * ROWS + offs_m[None, :],
                 tl.broadcast_to(payload[None, :], [WORLD, M_PAD]),
                 mask=xmask,
-                sem="relaxed",
+                sem="release",
                 scope="sys",
             )
             own = tl.load(recv_ptrs + RANK).to(tl.pointer_type(tl.int64))
@@ -331,7 +331,13 @@ def _screen_kernel(
                     is_pure=False,
                     pack=1,
                 )
-            tl.store(tptrs, tl.zeros([WORLD, M_PAD], dtype=tl.int64), mask=xmask)
+            taus = tl.atomic_xchg(
+                tptrs,
+                tl.zeros([WORLD, M_PAD], dtype=tl.int64),
+                mask=xmask,
+                sem="acq_rel",
+                scope="sys",
+            )
             k32 = (taus & 0xFFFFFFFF) ^ 0x80000000
             gk = tl.max(tl.where(xmask & (taus != 0), k32, 0), axis=0) - 0x80000000
             # A missing peer (timeout) leaves the rank's own tau.
@@ -466,14 +472,12 @@ def _exact_kernel(
         tl.store(cnt_ptr + 1, 0)
         tl.store(epoch_ptr, epoch + 1)
         if EXCHANGE:
-            # Push this rank's keys to every peer at once. The payload is the
-            # flag, so no fence is needed: a slot set is rewritten only after
-            # its reader's kernel that reset it has completed.
+            # Release orders prior slot consumption before publishing new keys.
             tl.atomic_xchg(
                 bases[:, None] + slot + RANK * ROWS + offs_m[None, :],
                 tl.broadcast_to(local[None, :], [WORLD, M_PAD]),
                 mask=xmask,
-                sem="relaxed",
+                sem="release",
                 scope="sys",
             )
             own = tl.load(recv_ptrs + RANK).to(tl.pointer_type(tl.int64))
@@ -493,8 +497,15 @@ def _exact_kernel(
                     is_pure=False,
                     pack=1,
                 )
+            # Consume and clear each payload atomically before publishing again.
+            keys = tl.atomic_xchg(
+                ptrs,
+                tl.zeros([WORLD, M_PAD], dtype=tl.int64),
+                mask=xmask,
+                sem="acq_rel",
+                scope="sys",
+            )
             local = tl.max(tl.where(xmask, keys, 0), axis=0)
-            tl.store(ptrs, tl.zeros([WORLD, M_PAD], dtype=tl.int64), mask=xmask)
             tl.store(out_ptr + offs_m, _key_token_ids(local), mask=m_mask)
         elif WORLD == 1:
             tl.store(out_ptr + offs_m, _key_token_ids(local), mask=m_mask)
@@ -541,7 +552,7 @@ class _Comm:
             bases = [int(p) for p in handle.buffer_ptrs]
             assert bases[self.rank] == recv.data_ptr()
             self.peer_ptrs = torch.tensor(bases, dtype=torch.int64, device=device)
-            torch.cuda.synchronize(device)
+            torch.accelerator.synchronize(device)
             handle.barrier()
             self.recv, self.handle = recv, handle
         except Exception as e:  # noqa: BLE001 - every rank falls back together
@@ -575,6 +586,7 @@ class Screen:
     """int8 copy of one lm_head shard, its bound coefficients and scratch."""
 
     def __init__(self, weight: torch.Tensor, n_valid: int) -> None:
+        self.launched = False
         rows, k = weight.shape
         dev = weight.device
         self.key = _weight_key(weight)
