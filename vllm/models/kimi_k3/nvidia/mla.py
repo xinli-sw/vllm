@@ -32,6 +32,7 @@ Out of scope (extension points, not wired here): prefill context parallelism
 """
 
 import math
+import os
 from typing import TYPE_CHECKING, cast
 
 import torch
@@ -79,6 +80,7 @@ from vllm.model_executor.utils import replace_parameter
 from vllm.models.common.ops import fused_q_kv_rmsnorm
 from vllm.models.kimi_k3.nvidia import dcp_context
 from vllm.models.kimi_k3.nvidia.low_latency_gemm import try_low_latency_gemm
+from vllm.models.kimi_k3.nvidia.ops import mla_qkv_norm, mla_qkv_quant
 from vllm.models.kimi_k3.nvidia.ops.fused_mla_key_concat_kv_cache import (
     fused_mla_decode_q_concat_kv_cache_insert,
     fused_mla_key_concat_ds_mla_insert,
@@ -112,6 +114,18 @@ if TYPE_CHECKING:
     )
 
 logger = init_logger(__name__)
+
+# VLLM_K3_MLA_QKV_NORM_ROWS=0: the common fused_q_kv_rmsnorm (one program per
+# row) for q_a / kv_a; ops/mla_qkv_norm.py is bitwise equal to it.
+_QKV_NORM_ROWS = os.environ.get("VLLM_K3_MLA_QKV_NORM_ROWS", "1") == "1"
+# VLLM_K3_MLA_QKV_QUANT_JIT=0: the _C fp8 prefill epilogue (q / k / v quant +
+# fp8 latent insert); ops/mla_qkv_quant is bitwise equal to it.
+_QKV_QUANT_JIT = os.environ.get("VLLM_K3_MLA_QKV_QUANT_JIT", "1") == "1"
+
+
+def use_qkv_quant_jit(q: torch.Tensor) -> bool:
+    return _QKV_QUANT_JIT and mla_qkv_quant.available() and mla_qkv_quant.eligible(q)
+
 
 # Below this conservative threshold, overlap the gate projection with attention
 # on the auxiliary stream.
@@ -559,7 +573,9 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         q_c, kv_c, k_pe = qkv_lora.split(
             [q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
         )
-        q_c, kv_c_normed = fused_q_kv_rmsnorm(
+        q_c, kv_c_normed = (
+            mla_qkv_norm.fused_q_kv_rmsnorm if _QKV_NORM_ROWS else fused_q_kv_rmsnorm
+        )(
             q_c,
             kv_c,
             self.q_a_layernorm.weight.data,
@@ -1275,7 +1291,11 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             kv_cache = self.kv_cache
             if kv_cache.dtype != torch.float8_e4m3fn:
                 kv_cache = kv_cache.view(torch.float8_e4m3fn)
-            q, k, v = fused_mla_qkv_quant_kv_cache_fp8_insert(
+            q, k, v = (
+                mla_qkv_quant.fused_mla_qkv_quant_kv_cache_fp8_insert
+                if use_qkv_quant_jit(q)
+                else fused_mla_qkv_quant_kv_cache_fp8_insert
+            )(
                 q,
                 k_nope,
                 k_pe,
