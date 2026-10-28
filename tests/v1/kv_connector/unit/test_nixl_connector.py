@@ -4676,3 +4676,25 @@ def test_explicit_kv_role_no_deprecation_warning(default_vllm_config, dist_init)
             mock_logger.warning_once.assert_not_called(),
             (f"kv_role={role!r} should not emit deprecation warning"),
         )
+
+
+@pytest.mark.parametrize(
+    "visible,expected", [("2", "c:1,d:1"), ("1", "a:1,b:1"), ("", "a:1,b:1")]
+)
+def test_ucx_net_devices_use_the_physical_gpu(monkeypatch, visible, expected):
+    """A DP rank launched with its own CUDA_VISIBLE_DEVICES sees ordinal 0; the
+    NIC table is keyed by the node's physical GPU index."""
+    import os
+
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl import base_worker
+    from vllm.distributed.kv_transfer.kv_connector.v1.nixl.worker import (
+        NixlConnectorWorker,
+    )
+    from vllm.platforms.cuda import CudaPlatform
+
+    monkeypatch.setattr(base_worker, "current_platform", CudaPlatform)
+    monkeypatch.setenv("UCX_NET_DEVICES", "inherited")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", visible)
+    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)
+    NixlConnectorWorker._select_ucx_net_devices("0-1=a:1+b:1;2-3=c:1+d:1")
+    assert os.environ["UCX_NET_DEVICES"] == expected
