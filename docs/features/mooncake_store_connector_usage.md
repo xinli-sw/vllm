@@ -54,6 +54,10 @@ Create a JSON configuration file (e.g., `mooncake_config.json`):
   `"standalone-store"` makes ranks pure requesters — an external
   `mooncake_client` process owns the CPU pool and (optionally) the SSD tier.
 - `protocol`: Use `"rdma"` for best performance. `"tcp"` works as a fallback.
+- `device_name`: RDMA devices for this rank (comma-separated, or `""` for
+  auto-discovery). On hosts with several NUMA nodes and NICs per node, a
+  per-node table such as `"numa:0=mlx5_0,mlx5_1;1=mlx5_6,mlx5_7"` gives each
+  rank the NICs of its GPU's NUMA node.
 - `global_segment_size`: CPU memory contributed to the distributed pool (per
   GPU). Must be `> 0` in `embedded` mode and `0` in `standalone-store` mode.
 - `local_buffer_size`: Private buffer for this node's own operations (per GPU).
@@ -275,6 +279,8 @@ Strict isolation requires a Mooncake master started with `--enable_multi_tenants
 
 - `load_async` (bool): Enable asynchronous loading for better compute-I/O overlap. Default: `true`.
 - `lookup_async` (bool): Run the external prefix-cache lookup on a background thread so it never blocks the scheduler step. The request is held until the in-flight lookup completes, then resumed on a later step. Default: `false`.
+- `lookup_from_local_hit` (bool): With fine-grained (sub-block) prefix hits, probe the store only from the scheduler block that contains the local GPU prefix-cache hit. Units below it are on the GPU and are never loaded from the store, so a long prompt that mostly hits the GPU cache costs a few hundred key probes instead of one per hash block, group and rank. Default: `false`.
+- `prune_superseded_checkpoints` (bool): For hybrid (Mamba "align") models, once a request stores its first boundary state beyond the prefix it resumed from, remove that resume point's state keys and sub-block partial-tail keys from the store. Multi-turn sessions otherwise leave one dead checkpoint per turn, which fills the pool. Removal waits `prune_delay_s` (default 65) so the read lease that the lookup or load granted (the master's `--default_kv_lease_ttl`, 60 s by default) has run out; keys still leased (a lookup's exists check also leases them) are retried every `prune_delay_s`, up to `prune_max_attempts` (default 10) attempts. A short master lease (e.g. `--default_kv_lease_ttl=5000` with `prune_delay_s` 6) lets sessions whose lookups keep probing their old keys be pruned between turns; loads finish in milliseconds. A branch that later resumes from a pruned point recomputes it. Default: `false`.
 - `lookup_rpc_port` (int): Custom port for the ZMQ lookup RPC socket. Default: `0`.
 - `cache_prefix` (str): Namespace prepended to every store key. Lets separate deployments share one Mooncake master without polluting each other — instances configured with different prefixes never see each other's cached blocks, even for identical prompts. All instances that should share a prefix cache must use the same value. Default: `""` (no prefix; keys are byte-identical to the unprefixed format).
 - `save_decode_cache` (bool): Enable offloading decode tokens' KV cache. A `kv_consumer` does not save during prefill; when decode starts, it fills any missing block-aligned prompt prefix before appending completed decode blocks. Default: `false`.
