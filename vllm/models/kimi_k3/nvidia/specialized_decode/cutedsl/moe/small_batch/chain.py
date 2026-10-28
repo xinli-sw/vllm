@@ -24,6 +24,14 @@ from .experts import ClusterExpertsTP8, ClusterExpertsTP16
 from .front_tp8 import MoeFrontTP8, MoeSharedTP8, SharedSituTables
 from .front_tp16 import MoeFrontTP16, initialize_designated
 
+# TP16 front (grid, early gate/up staging) per batch on parts with more than 152 SMs
+# (212): the o-projection leaves ~100 SMs free, and front CTAs beyond them start only
+# after it ends, holding up the placement barrier and routing. 1-GPU MoE chain (front,
+# routed experts, tail) after an o-projection-shaped predecessor, vs grid sms - 7B:
+# B1 -0.95 us, B2 -1.1 us; 130-135 CTAs are within 0.1 us, 160+ gain nothing. Other
+# parts: sms - 7B, gate/up rows staged after the latent multicast.
+WIDE_FRONT = {1: (132, True), 2: (130, False)}
+
 # Kernel class and trailing scalar arguments of each small-batch launch.
 _KERNELS = {
     "front": (MoeFrontTP8, (Int32,) * 3 + (Uint64, Float32)),
@@ -136,7 +144,9 @@ class SmallBatchChain:
             scores, ids, hg = box.scratch[b]
             tensors = head + (u32(scores), ids, box.w, down, box.h2.buffer, gate_up)
             tensors += (u32(hg), shared_down, box.s, box.designated)
-            front = _launch("front16", tensors, b, grid=box.sms - 7 * b, renorm=renorm)
+            grid, early = WIDE_FRONT[b] if box.sms > 152 else (box.sms - 7 * b, False)
+            kwargs = dict(grid=grid, renorm=renorm, early_gate=early)
+            front = _launch("front16", tensors, b, **kwargs)
             latent = box.h2.buffer[self.parity, :b].reshape(-1)
             g = box.g[self.slot, : b * 16]
             routed = _launch("experts_tp16", (latent, ids, maps, *scales, g), b)

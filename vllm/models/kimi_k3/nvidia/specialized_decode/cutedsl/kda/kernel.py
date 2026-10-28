@@ -39,6 +39,8 @@ load_activation_bf16x8 = partial(load_words, count=4, word_type="u32", mutable=T
 load_staged = partial(
     load_words, count=4, shared=True, mutable=True, result_type=Float32, word_type="f32"
 )
+load_state_bf16x4 = partial(load_words, count=2)
+load_staged_bf16x4 = partial(load_words, count=2, shared=True, mutable=True)
 
 
 @asm((Float32, Int32), pure=True)
@@ -87,6 +89,31 @@ def store_evict_f32x4(pointer, values):
     return code, "l,f,f,f,f", (pointer, *values)
 
 
+@asm()
+def store_bf16x4(pointer, values, *, evict=False, when=None):
+    """Four FP32 values rounded to nearest-even BF16 in one 8-byte store; ``evict``:
+    L2 evict-first; ``when``: predicated on it."""
+    head = "{ .reg .b32 w0,w1; "
+    hint = tail = guard = ""
+    if evict:
+        head += ".reg .b64 pol; "
+        guard = "createpolicy.fractional.L2::evict_first.b64 pol,1.0; "
+        hint, tail = ".L2::cache_hint", ",pol"
+    constraints, operands = "l,f,f,f,f", (pointer, *values)
+    if when is not None:
+        head += ".reg .pred p; "
+        guard += "setp.ne.b32 p,$5,0; @p "
+        constraints, operands = constraints + ",r", (*operands, Int32(when))
+    code = head + "cvt.rn.bf16x2.f32 w0,$2,$1; cvt.rn.bf16x2.f32 w1,$4,$3; " + guard
+    code += f"st.global{hint}.v2.b32 [$0],{{w0,w1}}{tail}; }}"
+    return code, constraints, operands
+
+
+def bf16x4_values(words):
+    """FP32 values (exact) of the four BF16 halves of two words, low half first."""
+    return tuple(value for word in words for value in unpack_bf16(word))
+
+
 class KdaSplit:
     """128 main threads and C value partitions. Conv state [slot, 3 * heads * 128, 3]
     and recurrent state [slot, head, value, key] keep their strides; slots <= 0 are
@@ -113,9 +140,34 @@ class KdaSplit:
     state comes from slot[b, accepted - 1] and token t's state goes to slot[b, t] if
     > 0; conv slot[b, 0] holds [dim, q + 2] with taps at accepted - 1 ..., rewritten to
     [c_accepted, c_accepted + 1, x_0, ..., x_q-1]. Token t's F_B row is MMA column t;
-    CTA t % C normalizes token t."""
+    CTA t % C normalizes token t.
 
-    def __init__(self, heads, batch, gate_mode, has_bias, schedule=(0, 0, 0), tokens=1):
+    ``bf16_state``: the recurrent state is BF16 (``--mamba-ssm-cache-dtype bfloat16``).
+    Rows load exactly to FP32, the update and the output use FP32, and the updated
+    state is rounded to nearest-even BF16 once, at its store (as the stock decode
+    kernels round a BF16 state).
+
+    ``lean`` (q > 1 with IEEE math): a CTA activates only the output gates of the
+    tokens it normalizes, and thread t < q activates token t's beta for the whole CTA
+    (shared memory), instead of every thread activating every token's gate and beta.
+    The same values reach the same uses: bitwise identical.
+
+    ``load_norm`` (q > 1): q and k are normalized at operand load, as q = 1 does,
+    instead of in a pass of their own before the token loop (one CTA barrier fewer).
+    Each element is the same q x factor product: bitwise identical."""
+
+    def __init__(
+        self,
+        heads,
+        batch,
+        gate_mode,
+        has_bias,
+        schedule=(0, 0, 0),
+        tokens=1,
+        bf16_state=False,
+        lean=False,
+        load_norm=False,
+    ):
         # The gate stage sends decays for tokens 2 * quarter + column (at most 8), while
         # the decay barrier expects 512 bytes per token: more tokens would never arrive.
         if not 1 <= tokens <= 8:
@@ -135,8 +187,14 @@ class KdaSplit:
         self.wave = min(4, self.passes) if self.staged else self.passes
         self.chunks = 32 // self.lanes_per_row
         assert not self.gate_staged or self.rows >= 64
-        self.evict = bool(evict)  # staged state traffic marked L2 evict-first
-        assert self.staged or not self.evict
+        self.evict = bool(evict)  # state stores (and staged loads) L2 evict-first
+        # Subclasses: the gate warp polls F_A's rows (``polled_fa``) instead of
+        # reading them after the PDL wait.
+        self.fa_polled = False
+        self.bf16_state = bf16_state
+        self.row_bytes = 256 if bf16_state else 512
+        self.lean = lean and tokens > 1 and not self.fast_math
+        self.load_norm = load_norm and tokens > 1
 
     @cute.jit
     def __call__(self, *args):
@@ -187,12 +245,17 @@ class KdaSplit:
             if cutlass.const_expr(owned > 1):  # one output barrier per owned token
                 barrier = smem.allocate(8 * owned, 8)
                 barrier = cute.recast_ptr(barrier, dtype=cutlass.Uint64)
-            if cutlass.const_expr(self.staged):
+            if cutlass.const_expr(self.staged and self.bf16_state):  # BF16 pairs
+                staged = alloc(smem, Uint32, (self.rows, 64), align=128)
+            elif cutlass.const_expr(self.staged):
                 staged = alloc(smem, Float32, (self.rows, 128), align=128)
+            if cutlass.const_expr(self.staged):
                 state_barrier = smem.allocate(cutlass.Uint64, 8)
             gate_rows = None
             if cutlass.const_expr(self.gate_staged):  # [copy, lane] 16-byte slots
                 gate_rows = alloc(smem, Uint32, (self.rows // 2, 32, 4), align=128)
+            if cutlass.const_expr(self.lean):  # each token's activated beta
+                shared_beta = alloc(smem, Float32, T)
             if cutlass.const_expr(self.trigger_at_entry):
                 cute.arch.griddepcontrol_launch_dependents()
             if cutlass.const_expr(not self.early):
@@ -217,7 +280,7 @@ class KdaSplit:
                     if thread == 0:
                         cute.arch.mbarrier_init(state_barrier, 1)
                         cute.arch.mbarrier_init_fence()
-                        size = self.rows * 512
+                        size = self.rows * self.row_bytes
                         cute.arch.mbarrier_arrive_and_expect_tx(state_barrier, size)
                         src, policy = state_row(0, 0), dict(evict_first=self.evict)
                         copy_g2s(staged.iterator, src, size, state_barrier, **policy)
@@ -226,7 +289,7 @@ class KdaSplit:
                     if row < self.rows:
                         for j in cutlass.range_constexpr(self.chunks):
                             column = 4 * (group_lane + self.lanes_per_row * j)
-                            values = load_f32x4(state_row(row, column))
+                            values = self.load_state(state_row(row, column))
                             for e in cutlass.range_constexpr(4):
                                 history[p, j, e] = values[e]
                 taps = zeros((3, 3), BFloat16)
@@ -260,12 +323,20 @@ class KdaSplit:
                             for u in cutlass.range_constexpr(T):
                                 channel = 2 * dim + value_channel
                                 inputs[3 * u + 2] = x[advance(token, u), channel]
-                    if cutlass.const_expr(self.early):  # converted at first use
-                        betas.append(beta[row, head])
-                        gates.append(gate[row, qk_channel])
-                    else:
-                        betas.append(Float32(beta[row, head]))
-                        gates.append(Float32(gate[row, qk_channel]))
+                    if cutlass.const_expr(not self.lean):
+                        if cutlass.const_expr(self.early):  # converted at first use
+                            betas.append(beta[row, head])
+                            gates.append(gate[row, qk_channel])
+                        else:
+                            betas.append(Float32(beta[row, head]))
+                            gates.append(Float32(gate[row, qk_channel]))
+                if cutlass.const_expr(self.lean):
+                    # thread t < q: token t's beta; the owned tokens' gates (in range
+                    # for CTAs that own none: those values go unused)
+                    betas.append(beta[token + thread % T, head])
+                    for k in cutlass.range_constexpr(owned):
+                        mine = token + (partition + k * self.cluster) % T
+                        gates.append(gate[mine, qk_channel])
                 cute.arch.griddepcontrol_launch_dependents()
 
                 vs, squares, qks = [], [], []
@@ -282,12 +353,17 @@ class KdaSplit:
                 if cutlass.const_expr(T > 1 and not self.fast_math):
                     raw = [accum[i] for i in range(3 * T)] + betas + gates
                     act = partial(lambda batch, i, value: batch[i], sigmoids(raw))
+                if cutlass.const_expr(self.lean):
+                    if thread < T:
+                        shared_beta[thread] = act(3 * T, betas[0])
+                    gates = [act(3 * T + 1 + k, gates[k]) for k in range(owned)]
                 for t in cutlass.range_constexpr(T):
                     q = accum[3 * t] * act(3 * t, accum[3 * t])
                     k = accum[3 * t + 1] * act(3 * t + 1, accum[3 * t + 1])
                     v = accum[3 * t + 2] * act(3 * t + 2, accum[3 * t + 2])
-                    betas[t] = act(3 * T + t, Float32(betas[t]))
-                    gates[t] = act(4 * T + t, Float32(gates[t]))
+                    if cutlass.const_expr(not self.lean):
+                        betas[t] = act(3 * T + t, Float32(betas[t]))
+                        gates[t] = act(4 * T + t, Float32(gates[t]))
                     shared_q[advance(thread, 128 * t)] = q
                     shared_k[advance(thread, 128 * t)] = k
                     vs.append(v)
@@ -313,7 +389,8 @@ class KdaSplit:
                     fq = cute.math.rsqrt(qn + 1.0e-6, fastmath=True) * scale
                     return fq, cute.math.rsqrt(kn + 1.0e-6, fastmath=True)
 
-                if cutlass.const_expr(T > 1):  # normalize each token's q, k once
+                at_load = T == 1 or self.load_norm  # q, k normalized at operand load
+                if cutlass.const_expr(not at_load):  # normalize each token's q, k once
                     for t in cutlass.range_constexpr(T):
                         fq, fk = factors(t)
                         shared_q[128 * t + thread] = qks[2 * t] * fq
@@ -321,7 +398,7 @@ class KdaSplit:
                     cute.arch.barrier(barrier_id=1, number_of_threads=128)
 
                 def operands(t):
-                    fq, fk = factors(t) if T == 1 else (None, None)
+                    fq, fk = factors(t) if at_load else (None, None)
                     qr = cute.make_rmem_tensor((self.chunks, 4), Float32)
                     kr = cute.make_rmem_tensor((self.chunks, 4), Float32)
                     for j in cutlass.range_constexpr(self.chunks):
@@ -333,8 +410,8 @@ class KdaSplit:
                             advance(shared_k.iterator, 128 * t) + column, shared=True
                         )
                         for e in cutlass.range_constexpr(4):
-                            qr[j, e] = q4[e] * fq if T == 1 else q4[e]
-                            kr[j, e] = k4[e] * fk if T == 1 else k4[e]
+                            qr[j, e] = q4[e] * fq if at_load else q4[e]
+                            kr[j, e] = k4[e] * fk if at_load else k4[e]
                     if cutlass.const_expr(t == 0):
                         wait(gate_barrier)
                     decays = []
@@ -346,7 +423,8 @@ class KdaSplit:
                     if cutlass.const_expr(T > 1):
                         pointer = shared_v.iterator + self.rows * t
                         values = cute.make_tensor(pointer, cute.make_layout(self.rows))
-                    return kr, qr, decays, values, betas[t]
+                    beta_t = shared_beta[t] if self.lean else betas[t]
+                    return kr, qr, decays, values, beta_t
 
                 ready = operands(0)
                 for t in cutlass.range_constexpr(T):
@@ -402,7 +480,8 @@ class KdaSplit:
                             sums[g] = warp_sum((s0 + s2) + (s1 + s3), 8)
                         sumsq = (sums[0] + sums[2]) + (sums[1] + sums[3])
                         rstd = cute.math.rsqrt(sumsq * (1.0 / 128) + eps, fastmath=True)
-                        result = raw_o * rstd * nw * gates[t]
+                        out_gate = gates[t // self.cluster] if self.lean else gates[t]
+                        result = raw_o * rstd * nw * out_gate
                         output[advance(token, t), qk_channel] = BFloat16(result)
                         if cutlass.const_expr(t == 0):
                             for section in cutlass.range_constexpr(2):
@@ -426,16 +505,30 @@ class KdaSplit:
                     column = 4 * (group_lane + self.lanes_per_row * j)
                     values = [history[p, j, e] for e in range(4)]
                     pointer = state_row(row % self.rows, column)
-                    store_f32x4(pointer, values, when=when & (row < self.rows))
+                    self.store_state(pointer, values, when & (row < self.rows))
             elif row < self.rows:
                 for j in cutlass.range_constexpr(self.chunks):
                     column = 4 * (group_lane + self.lanes_per_row * j)
                     pointer = state_row(row, column)
                     row_values = [history[p, j, e] for e in range(4)]
-                    if cutlass.const_expr(self.evict):
-                        store_evict_f32x4(pointer, row_values)
-                    else:
-                        store_f32x4(pointer, row_values)
+                    self.store_state(pointer, row_values)
+
+    def load_state(self, pointer):
+        """Four consecutive state values of a row as FP32."""
+        if self.bf16_state:
+            return bf16x4_values(load_state_bf16x4(pointer))
+        return load_f32x4(pointer)
+
+    def store_state(self, pointer, values, when=None):
+        """Store four state values (BF16: the one rounding of the updated state)."""
+        if self.bf16_state:
+            store_bf16x4(pointer, values, evict=self.evict, when=when)
+        elif when is not None:
+            store_f32x4(pointer, values, when=when)
+        elif self.evict:
+            store_evict_f32x4(pointer, values)
+        else:
+            store_f32x4(pointer, values)
 
     @cute.jit
     def update(self, history, dots, operands, lanes, span, staged):
@@ -448,7 +541,11 @@ class KdaSplit:
                 row = (p * self.groups + group) % self.rows
                 for j in cutlass.range_constexpr(self.chunks):
                     column = 4 * (lane + self.lanes_per_row * j)
-                    values = load_staged(staged.iterator + (row * 128 + column))
+                    if cutlass.const_expr(self.bf16_state):
+                        pair = staged.iterator + (row * 64 + (column >> 1))
+                        values = bf16x4_values(load_staged_bf16x4(pair))
+                    else:
+                        values = load_staged(staged.iterator + (row * 128 + column))
                     for e in cutlass.range_constexpr(4):
                         history[p, j, e] = values[e]
         for p in cutlass.range_constexpr(start, stop):
@@ -471,6 +568,15 @@ class KdaSplit:
         for shift in reversed(range(self.lanes_per_row.bit_length() - 1)):
             for p in cutlass.range_constexpr(start, stop):
                 dots[p] += cute.arch.shuffle_sync_bfly(dots[p], 1 << shift)
+
+    def polled_fa(self, f_a, token, quarter, args):
+        """``fa_polled`` subclasses: the gate warp's F_A operands (8 chunks of 4 BF16
+        of the lane's token, columns 16 c + 4 quarter), polled."""
+        raise NotImplementedError
+
+    def release_fa(self, args, request, lane):
+        """``fa_polled`` subclasses: the gate warp's F_A reads of ``request`` done."""
+        raise NotImplementedError
 
     @cute.jit
     def gate_warp(self, args, shared_decay, barrier, coords, staged_rows):
@@ -555,18 +661,24 @@ class KdaSplit:
                             high = load_bf16x4(at(weight, row + 8, col))
                             wr[tile, chunk, 0], wr[tile, chunk, 2] = low
                             wr[tile, chunk, 1], wr[tile, chunk, 3] = high
-            cute.arch.griddepcontrol_wait()
-            if cutlass.const_expr(wide):
-                pairs = [
-                    load_activation_bf16x8(at(f_a, token, 32 * c + 8 * quarter))
-                    for c in range(4)
-                ]
-                ar = [pairs[c // 2][2 * (c % 2) : 2 * (c % 2) + 2] for c in range(8)]
+            if cutlass.const_expr(self.fa_polled):
+                assert not wide
+                ar = self.polled_fa(f_a, token, quarter, args)
             else:
-                ar = [
-                    load_activation_bf16x4(at(f_a, token, 16 * c + 4 * quarter))
-                    for c in range(8)
-                ]
+                cute.arch.griddepcontrol_wait()
+                if cutlass.const_expr(wide):
+                    pairs = [
+                        load_activation_bf16x8(at(f_a, token, 32 * c + 8 * quarter))
+                        for c in range(4)
+                    ]
+                    ar = [
+                        pairs[c // 2][2 * (c % 2) : 2 * (c % 2) + 2] for c in range(8)
+                    ]
+                else:
+                    ar = [
+                        load_activation_bf16x4(at(f_a, token, 16 * c + 4 * quarter))
+                        for c in range(8)
+                    ]
             if cutlass.const_expr(staged_rows is not None):
                 cute.arch.cp_async_wait_group(0)
                 for tile in cutlass.range_constexpr(tiles):
@@ -584,6 +696,9 @@ class KdaSplit:
             if cutlass.const_expr(self.tokens > 1):
                 gates = (a, lower_bound, dt, features)
                 targets = (shared_decay, barrier, value_base)
+                if cutlass.const_expr(self.fa_polled):
+                    self.multicast(acc, gates, targets, lane)
+                    return self.release_fa(args, token // self.tokens, lane)
                 return self.multicast(acc, gates, targets, lane)
             raw_g = []
             for r in cutlass.range_constexpr(per):

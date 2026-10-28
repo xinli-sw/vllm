@@ -11,8 +11,9 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, Uint32, Uint64
 
-from ..common.mailbox import poll, rearm
+from ..common.mailbox import poll, poll_warp, rearm
 from ..common.primitives import (
+    add_rn,
     alloc,
     at,
     bf16,
@@ -69,10 +70,39 @@ def arm_exchanges(bars, counts):
         cute.arch.mbarrier_init_fence()
 
 
+# Shared memory of one ClusterAttnRes CTA (``setup``'s buffers). The in-projections
+# that follow an AttnRes (KdaHeadWide / KdaHeadVerify, SplitKTmemGemm, SplitKTmemGemm64)
+# load their weights beside its CTAs (carve-out 100): BESIDE_SMEM is the largest
+# request (a KB multiple) that fits beside one AttnRes CTA in an SM's 228 KB, with the
+# driver's 1 KB per CTA for each; they assert it where they size themselves. One byte
+# more and their clusters wait for the AttnRes CTAs to exit (KdaHeadVerify at 225 KB:
+# +1.5 us per KDA layer at 16 ranks).
+SMEM_BYTES = 64 * 4 + 3 * 112 * 4 + 3 * 16 * 4 + 3 * 8
+BESIDE_SMEM = (228 * 1024 - 2 * 1024 - SMEM_BYTES) // 1024 * 1024
+
+
 class ClusterAttnRes:
-    def __init__(self, nb, *, slots=1, has_delta=True, write=-1, final=False):
+    """``sanitize``: multi-slot sums map -0 to +0 after rounding, as the framework
+    all-reduce they replace does (the Rubin dense ring)."""
+
+    def __init__(
+        self, nb, *, slots=1, has_delta=True, write=-1, final=False, sanitize=False,
+        stores_first=False, spread_push=False, poll_warp=False, min_blocks=0,
+    ):  # fmt: skip
+        # ``poll_warp`` (Rubin): the delta's Lamport poll exits by a warp vote
+        # (``common.mailbox.poll_warp``), so the exchange's shuffles that follow do not
+        # wait for per-lane poll loops to reconverge. Same words.
+        self.poll_warp = poll_warp
+        # ``min_blocks``: launch bound (CTAs per SM) that caps the registers per thread
+        # at 64 K / (128 x min_blocks), so a variant keeps its register allocation and
+        # the in-projection CTAs that load beside it stay co-resident. Same code.
+        self.min_blocks = min_blocks
         self.nb, self.slots, self.has_delta = nb, slots, has_delta
-        self.write, self.final = write, final
+        self.write, self.final, self.sanitize = write, final, sanitize
+        self.stores_first = stores_first
+        # ``spread_push``: the exchange's 7 x count DSMEM pushes come from 7 x count
+        # threads (one each) instead of count threads pushing to every peer.
+        self.spread_push = spread_push
         self.npre = 2 * nb
         self.npost = (2 if final else 4) if nb else 1
         self.kpre = 1 << max(self.npre - 1, 0).bit_length()
@@ -80,7 +110,11 @@ class ClusterAttnRes:
 
     @cute.jit
     def __call__(self, *args):
-        launch(self.kernel, args, (7, args[1].shape[0], 1), 128, 7)
+        if cutlass.const_expr(self.min_blocks > 0):
+            grid, bound = (7, args[1].shape[0], 1), self.min_blocks
+            launch(self.kernel, args, grid, 128, 7, min_blocks_per_mp=bound)
+        else:
+            launch(self.kernel, args, (7, args[1].shape[0], 1), 128, 7)
 
     @cute.jit
     def exchange(
@@ -95,7 +129,12 @@ class ClusterAttnRes:
         if (lane & (32 // kpad - 1)) == 0 and index < count:
             wb[warp * 16 + index] = reduced
         group_barrier(0)
-        if tid < count:
+        if cutlass.const_expr(self.spread_push):
+            if tid < 7 * count:
+                i, peer = tid % count, tid // count
+                value = (wb[i] + wb[16 + i]) + (wb[32 + i] + wb[48 + i])
+                push_float(peer_buf.iterator + rank * 16 + i, value, bar, peer)
+        elif tid < count:
             value = (wb[tid] + wb[16 + tid]) + (wb[32 + tid] + wb[48 + tid])
             for peer in cutlass.range_constexpr(7):
                 push_float(peer_buf.iterator + rank * 16 + tid, value, bar, Int32(peer))
@@ -118,7 +157,8 @@ class ClusterAttnRes:
         state = self.state()
         rows, ids = (prefix, blocks, norm, query, out_norm), (rank, token, tid)
         self.pre(state, bufs, rows, eps, ids)
-        self.post(state, bufs, delta, rows, output, eps, out_eps, ids, args[9:])
+        extra = args[9:]
+        self.post(state, bufs, delta, rows, output, eps, out_eps, ids, extra)
         cute.arch.griddepcontrol_wait()
 
     def state(self):
@@ -126,7 +166,7 @@ class ClusterAttnRes:
         return cute.make_rmem_tensor((1, 8), Float32), cute.make_rmem_tensor(2, Float32)
 
     @cute.jit
-    def setup(self, smem):
+    def setup(self, smem):  # SMEM_BYTES
         warp_buf = alloc(smem, Float32, 64)
         peer_buf = alloc(smem, Float32, (3, 112))
         total = alloc(smem, Float32, (3, 16))
@@ -182,6 +222,15 @@ class ClusterAttnRes:
                 v[self.nb, i] = bf16(nw[i // 2], i % 2) * bf16(qw[i // 2], i % 2)
 
     @cute.jit
+    def store_rows(self, row, prefix, blocks, aux, token, col):
+        """The updated prefix row (and its ``aux`` copies and saved block)."""
+        store_words(at(prefix, token, col), row)
+        for stream_out in aux:
+            store_words(at(stream_out, token, col), row)
+        if cutlass.const_expr(self.write >= 0):
+            store_words(block_ptr(blocks, token, self.write, col), row)
+
+    @cute.jit
     def post(
         self, state, bufs, delta, rows, output, eps: Float32, out_eps: Float32, ids, aux
     ):
@@ -206,7 +255,10 @@ class ClusterAttnRes:
         else:
             cur.fill(0)
             base = delta.iterator + token * 7168 + col
-            got = poll(base, delta.shape[1] * 7168, self.slots)
+            if cutlass.const_expr(self.poll_warp):
+                got = poll_warp(base, delta.shape[1] * 7168, self.slots)
+            else:
+                got = poll(base, delta.shape[1] * 7168, self.slots)
             for slot in cutlass.range_constexpr(self.slots):
                 rearm(base + slot * delta.shape[1] * 7168)
                 part = cute.make_rmem_tensor((1, 8), Float32)
@@ -216,6 +268,10 @@ class ClusterAttnRes:
             if cutlass.const_expr(self.slots > 1):
                 for j in cutlass.range_constexpr(4):  # all-reduce output boundary
                     round_pair(cur, 0, j)
+            if cutlass.const_expr(self.slots > 1 and self.sanitize):
+                # No negative zero, as the framework all-reduce returns (-0 + 0 = +0).
+                for i in cutlass.range_constexpr(8):
+                    cur[0, i] = add_rn(cur[0, i], Float32(0))
         words = cute.make_rmem_tensor(4, Uint32)
         for j in cutlass.range_constexpr(4):
             lo, hi = cur[0, 2 * j], cur[0, 2 * j + 1]
@@ -230,13 +286,12 @@ class ClusterAttnRes:
             if cutlass.const_expr(not self.final):
                 values[2] = dot8(mixture, 0, v, NEW)
                 values[3] = dot8(mixture, 0, mixture, 0)
-        self.exchange(values, self.npost, self.kpost, bufs, 1, ids)
         row = (words[0], words[1], words[2], words[3])
-        store_words(at(prefix, token, col), row)
-        for stream_out in aux:
-            store_words(at(stream_out, token, col), row)
-        if cutlass.const_expr(self.write >= 0):
-            store_words(block_ptr(blocks, token, self.write, col), row)
+        if cutlass.const_expr(self.stores_first):
+            self.store_rows(row, prefix, blocks, aux, token, col)
+        self.exchange(values, self.npost, self.kpost, bufs, 1, ids)
+        if cutlass.const_expr(not self.stores_first):
+            self.store_rows(row, prefix, blocks, aux, token, col)
         result = cute.make_rmem_tensor((1, 8), Float32)
         if cutlass.const_expr(self.nb == 0):
             scale = rstd(total[1, 0], out_eps)

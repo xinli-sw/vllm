@@ -14,6 +14,11 @@ class DecodeConfig:
     # Tokens per request in a verify step (1 + draft tokens; 1 without speculation).
     q: int
     capture_sizes: tuple[int, ...]
+    # KDA recurrent state in BF16 (--mamba-ssm-cache-dtype bfloat16; Rubin only): the
+    # KdaHead layers need it.
+    bf16_state: bool = False
+    # Token rows of the runner's FULL decode graphs (``shapes.captured_rows``).
+    captured: tuple[int, ...] = ()
 
 
 def specialized_decode_config(vllm_config) -> DecodeConfig | None:
@@ -25,18 +30,28 @@ def specialized_decode_config(vllm_config) -> DecodeConfig | None:
         return None
     if backend != "latency_specialized":
         raise ValueError("Supported decode_backend values are auto/latency_specialized")
+    import torch
+
     reason = unsupported(vllm_config)
     if reason is not None:
         raise ValueError(f"Kimi K3 specialized decode does not support {reason}")
-    spec = vllm_config.speculative_config
+    from ..shapes import captured_rows
+
+    spec, compilation = vllm_config.speculative_config, vllm_config.compilation_config
+    q = 1 + spec.num_speculative_tokens if spec is not None else 1
+    sizes = tuple(compilation.cudagraph_capture_sizes or ())
+    # The runner's uniform decode graphs (cudagraph_utils): at most max_num_seqs
+    # requests and the largest capture size.
+    limit = vllm_config.scheduler_config.max_num_seqs * q
+    limit = min(limit, compilation.max_cudagraph_capture_size or max(sizes, default=0))
     return DecodeConfig(
         max_context=vllm_config.model_config.max_model_len,
         mla_core=extra.get("mla_core", "auto"),
         dcp=vllm_config.parallel_config.decode_context_parallel_size,
-        q=1 + spec.num_speculative_tokens if spec is not None else 1,
-        capture_sizes=tuple(
-            vllm_config.compilation_config.cudagraph_capture_sizes or ()
-        ),
+        q=q,
+        capture_sizes=sizes,
+        bf16_state=kda_dtypes(vllm_config)[1] == torch.bfloat16,
+        captured=captured_rows(sizes, q, limit),
     )
 
 
@@ -76,6 +91,12 @@ def unsupported(vllm_config) -> str | None:
     )
     compilation = vllm_config.compilation_config
     graphs = compilation.cudagraph_mode
+    # KdaSplit's BF16-state variant runs on Rubin (compute capability 10.7, the key of
+    # its schedules, ``kda.prepared.BF16_DEVICE_SCHEDULE``) only; elsewhere the
+    # recurrent state stays FP32.
+    states = [torch.float32]
+    if current_platform.is_device_capability((10, 7)):
+        states.append(torch.bfloat16)
     checks = (
         (not current_platform.is_device_capability_family(100), "this GPU (SM100/103)"),
         (
@@ -110,12 +131,13 @@ def unsupported(vllm_config) -> str | None:
             spec is not None and spec.enable_adaptive_verification,
             "adaptive verification",
         ),
-        # KdaSplit keeps a BF16 conv state and an FP32 recurrent state in place; it
-        # maintains neither other cache dtypes nor ReplaySSM / RecoverSSM records.
+        # KdaSplit keeps a BF16 conv state and an FP32 (Rubin: or BF16) recurrent
+        # state in place; it maintains neither other cache dtypes nor ReplaySSM /
+        # RecoverSSM records.
         (
-            kda_dtypes(vllm_config) != (torch.bfloat16, torch.float32),
+            kda_dtypes(vllm_config) not in [(torch.bfloat16, s) for s in states],
             "KDA cache dtypes other than a BF16 conv state and an FP32 recurrent "
-            "state (mamba cache dtype)",
+            "state (mamba cache dtype; a BF16 recurrent state on Rubin only)",
         ),
         (
             vllm_config.cache_config.use_replayssm

@@ -169,6 +169,36 @@ def sigmoid(value: Float32, fast_math: cutlass.Constexpr = None):
 
 
 @asm(Float32, pure=True)
+def reciprocal_fast(denominator: Float32):
+    """``div.rn.f32 1, d``'s fast path without its range check: approximate reciprocal,
+    a Newton step, then the remainder correction. Equal to div.rn where the fast path
+    applies; callers keep div.rn for d outside [1, 2^120) and NaN (``sigmoids``)."""
+    code = (
+        "{ .reg .f32 r,e,q; rcp.approx.f32 r,$1; fma.rn.f32 e,$2,r,0f3F800000; "
+        "fma.rn.f32 r,r,e,r; fma.rn.f32 q,r,0f3F800000,0f00000000; "
+        "fma.rn.f32 e,$2,q,0f3F800000; fma.rn.f32 $0,r,e,q; }"
+    )
+    return code, "=f,f,f", (denominator, -denominator)
+
+
+@cute.jit
+def sigmoids(a: Float32, b: Float32, c: Float32, d: Float32):
+    """Exact ``sigmoid`` of four values (bitwise equal), the reciprocals' fast paths
+    interleaved and one shared fallback branch instead of a branch per division."""
+    da = Float32(1) + cute.math.exp(-a, fastmath=False)
+    db = Float32(1) + cute.math.exp(-b, fastmath=False)
+    dc = Float32(1) + cute.math.exp(-c, fastmath=False)
+    dd = Float32(1) + cute.math.exp(-d, fastmath=False)
+    ra, rb = reciprocal_fast(da), reciprocal_fast(db)
+    rc, rd = reciprocal_fast(dc), reciprocal_fast(dd)
+    limit = Float32(2.0**120)  # NaN compares False: div.rn
+    if not ((da < limit) & (db < limit) & (dc < limit) & (dd < limit)):
+        ra, rb = div_rn(Float32(1), da), div_rn(Float32(1), db)
+        rc, rd = div_rn(Float32(1), dc), div_rn(Float32(1), dd)
+    return ra, rb, rc, rd
+
+
+@asm(Float32, pure=True)
 def routing_sigmoid(value: Float32):
     code = "{ .reg .f32 h,t; mul.ftz.f32 h,$1,0f3f000000; tanh.approx.f32 t,h; "
     code += "fma.rn.ftz.f32 $0,t,0f3f000000,0f3f000000; }"
@@ -471,7 +501,7 @@ def load_words(
 
 smem_words = partial(load_words, count=4, shared=True, mutable=True)
 load_volatile = partial(load_words, count=1, volatile=True, word_type="u32")
-mailbox_load = partial(load_words, count=1, scope="gpu", word_type="u32")
+mailbox_load = partial(load_words, count=1, scope="sys", word_type="u32")
 load_f32x4 = partial(load_words, count=4, result_type=Float32, word_type="f32")
 early_weights = partial(
     load_words, cache_policy="nc.L1::no_allocate", word_type="u32", mutable=True

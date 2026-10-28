@@ -1613,6 +1613,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             logits = logits[:, : self.vocab_size]
         else:
             sample_hidden_states = hidden_states[input_batch.logits_indices]
+            if (
+                grammar_output is None
+                and input_batch.num_draft_tokens > 0
+                and self.rejection_sampler is not None
+                and self.speculator is not None
+                and self.rejection_sampler.can_verify_sharded(self.model, input_batch)
+            ):
+                # Greedy and temperature-1 requests: the model verifies them from
+                # its vocabulary-sharded logits, without the full-vocab logits.
+                out = self.rejection_sampler.verify_sharded(
+                    self.model,
+                    sample_hidden_states,
+                    input_batch,
+                    self.speculator.draft_logits,
+                )
+                if out is not None:
+                    return out, out.num_sampled, out.num_rejected
             logits = self.model.compute_logits(sample_hidden_states)
 
         invalid_drafts = None

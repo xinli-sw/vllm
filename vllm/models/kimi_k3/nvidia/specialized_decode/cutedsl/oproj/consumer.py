@@ -112,11 +112,25 @@ class OprojConsumer:
         has_delta=True,
         groups=4,
         twoshot=False,
+        batched=False,
+        reduced=False,
+        vote=False,
     ):
         if not 0 <= nb <= 8:
             raise ValueError("Output-projection AttnRes supports zero to eight blocks")
         self.nb, self.has_delta = nb, has_delta
         self.groups, self.twoshot = groups, twoshot
+        # ``reduced`` (two-shot): the producer's CTAs reduce the owned columns and
+        # multicast the gather (``OprojUmma(reduce=True)``); this kernel only polls it.
+        self.reduced = reduced
+        # ``batched`` (two-shot): the owners poll their receive slots with every load
+        # in flight (``common.twoshot.poll_slots``); same sums, bitwise.
+        self.batched = batched
+        # ``vote`` (Rubin, B<=8): ``poll_sum`` reloads every rank slot each pass and
+        # leaves the loop on a warp vote, instead of re-polling only the pending slots
+        # (predicated temporaries merged a few loads at a time) in per-lane loops that
+        # the named barrier and shuffles after them wait to reconverge. Same sums.
+        self.vote = vote
         self.kpre = 1 << max(0, (2 * nb - 1).bit_length())
         self.npost = 4 if nb > 0 else 1
 
@@ -236,6 +250,19 @@ class OprojConsumer:
         for rank in cutlass.range_constexpr(n):
             if rank < count:
                 fetch(raw, rank, at(mailbox, first + rank, token, h))
+        if cutlass.const_expr(self.vote):
+            ready = True
+            for rank in cutlass.range_constexpr(n):
+                if rank < count:
+                    ready &= published(raw[rank, j] for j in range(4))
+            while not cute.arch.vote_all_sync(ready):
+                for rank in cutlass.range_constexpr(n):
+                    if rank < count:
+                        fetch(raw, rank, at(mailbox, first + rank, token, h))
+                ready = True
+                for rank in cutlass.range_constexpr(n):
+                    if rank < count:
+                        ready &= published(raw[rank, j] for j in range(4))
         for rank in cutlass.range_constexpr(n):
             if rank < count:  # noqa: SIM102
                 if not published(raw[rank, j] for j in range(4)):
@@ -293,10 +320,10 @@ class OprojConsumer:
                 if r < count:
                     rearm(at(mailbox, first + r, token, h))
         else:
-            if cutlass.const_expr(self.twoshot):
+            if cutlass.const_expr(self.twoshot and not self.reduced):
                 recv, gather_mc, me = args[11:14]
                 if h // recv.shape[2] == me:
-                    reduce(recv, mailbox, gather_mc, me, token, h)
+                    reduce(recv, mailbox, gather_mc, me, token, h, self.batched)
             if cutlass.const_expr(self.has_delta):
                 old = self.fragment(pf, 3, tid)
             attn = self.poll_sum(mailbox, token, h, 0, min(S, mailbox.shape[0]))
@@ -387,10 +414,33 @@ class OprojConsumer:
 
 
 class OprojFused:
-    def __init__(self, nb, *, has_delta=True):
-        self.producer = OprojProducer(768, staged_blocks=0)
+    """``x_shared`` (Rubin): the producer copies x to shared memory once per CTA
+    instead of every warp reading its K slice from L2 (the same MMA operands, so
+    bitwise identical). ``polled_x`` (with ``x_shared``; Rubin MLA layers, see
+    mla.dcp.POLLED_OUTPUT): x is DcpValue's Lamport output buffer, polled instead of
+    read after the PDL wait, which moves to the end (completion stays transitive);
+    ``"half"``: x is KdaHead's polled output (kda.head.POLLED_OUT, 0xFFFF elements).
+    ``drain`` (Rubin): a GPU-scope fence after the multicast publish, off the critical
+    path: a grid whose CTAs issued NVLink stores and never fenced them pays ~0.2 us
+    more at its grid-end flush, i.e. its PDL dependents' ``griddepcontrol.wait``
+    returns later, however early the stores were issued. The producer-only CTAs fence
+    right after publishing (they exit next); in the consumer CTAs the publishing
+    threads arrive on a named barrier and the last warp syncs on it and fences once
+    its poll group is done. Only adds ordering; bitwise identical."""
+
+    DRAIN_BARRIER = 5
+
+    def __init__(
+        self, nb, *, has_delta=True, x_shared=False, polled_x=False, drain=False,
+        vote=False,
+    ):  # fmt: skip
+        self.polled_x = polled_x if x_shared else False  # True / "half" (KdaHead x)
+        self.producer = OprojProducer(
+            768, staged_blocks=0, x_shared=x_shared, vote=vote and bool(self.polled_x)
+        )
         # TP16 requires prefix/blocks to be ready at launch.
-        self.consumer = OprojConsumer(nb, has_delta=has_delta)
+        self.consumer = OprojConsumer(nb, has_delta=has_delta, vote=vote)
+        self.drain = drain
 
     @cute.jit
     def __call__(self, *args):
@@ -417,7 +467,23 @@ class OprojFused:
         maximum, exponent_sum, qpart = Float32(0), Float32(0), Float32(0)
         if group0:
             maximum, exponent_sum, qpart = self.consumer.pre(state, rank, rows[9], mix)
-        self.producer.compute(args, smem, weights, cta, False)
+        self.producer.compute(args, smem, weights, cta, False, self.polled_x)
+        # The last publish's threads (``OprojProducer.publish``) and the drain warp.
+        _, gt, ng = self.producer.schedule(x.shape[0])
+        publishers: cutlass.Constexpr = 8 * min(x.shape[0] - (ng - 1) * gt * 8, gt * 8)
+        drainers: cutlass.Constexpr = publishers + 32
+        if cutlass.const_expr(self.drain):  # noqa: SIM102 (compile-time)
+            if tid < publishers:
+                if active:
+                    named_barrier(self.DRAIN_BARRIER, drainers, arrive=True)
+                else:
+                    cute.arch.fence_acq_rel_gpu()
         if active:
             block_mix = (mix, maximum, exponent_sum, qpart)
             self.consumer.post(rows, state, block_mix, rank, cluster)
+            if cutlass.const_expr(self.drain):  # noqa: SIM102 (compile-time)
+                if tid >= 512 - 32:  # the last poll group's last warp
+                    named_barrier(self.DRAIN_BARRIER, drainers)
+                    cute.arch.fence_acq_rel_gpu()
+        if cutlass.const_expr(self.polled_x):
+            cute.arch.griddepcontrol_wait()
