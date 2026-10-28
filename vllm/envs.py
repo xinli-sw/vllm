@@ -213,6 +213,11 @@ if TYPE_CHECKING:
     VLLM_USE_FUSED_MOE_GROUPED_TOPK: bool = True
     VLLM_MOE_SKIP_PADDING: bool = True
     VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT: bool = False
+    VLLM_KIMI_K3_MOE_TOKEN_SHARD: bool = False
+    VLLM_KIMI_K3_MOE_TOKEN_SHARD_GEMM_AR: bool = False
+    VLLM_KIMI_K3_MOE_TOKEN_SHARD_GEMM_AR_MIN_TOKENS: int = 288
+    VLLM_KIMI_K3_VEC_SITU: bool = False
+    VLLM_KIMI_K3_GEMM_AR_ALIAS: bool = False
     VLLM_KIMI_K3_AUX_ATTN_RES_STREAM: bool = False
     VLLM_KIMI_K3_GEMM_AR: bool = True
     VLLM_ENABLE_GEMM_RS: bool = False
@@ -266,6 +271,7 @@ if TYPE_CHECKING:
     VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT: int = 480
     VLLM_MOONCAKE_CONNECTOR_TIMEOUT: float = 30.0
     VLLM_ENABLE_CUDAGRAPH_GC: bool = False
+    VLLM_MM_EMBEDS_ON_CONSUMERS: bool = True
     VLLM_LOOPBACK_IP: str = ""
     VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE: bool = True
     VLLM_ENABLE_RESPONSES_API_STORE: bool = False
@@ -307,6 +313,7 @@ if TYPE_CHECKING:
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
     VLLM_USE_V2_MODEL_RUNNER: bool | None = None
+    VLLM_TRIM_NEW_REQUEST_TOKEN_IDS: bool = True
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
@@ -1653,6 +1660,41 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT": lambda: bool(
         int(os.getenv("VLLM_KIMI_K3_SHARD_SP_SHARED_EXPERT", "0"))
     ),
+    # Kimi-K3 only, with --enable-expert-parallel and the deep_gemm_mega_moe MoE
+    # backend at TP > 1 (DP 1). Instead of full sequence parallelism, keep the
+    # residual stream, AttnRes and attention replicated as under plain TP and
+    # shard only the routed MoE by token: each rank routes, down-projects and
+    # dispatches its 1/TP slice of the tokens through MegaMoE (EP over the TP
+    # ranks), up-projects it into its rows of the TP-sharded shared-expert
+    # partial, and one all-reduce finishes the layer. Keeps the shared experts
+    # TP-sharded (no replicated weights) for prefill workers.
+    "VLLM_KIMI_K3_MOE_TOKEN_SHARD": lambda: bool(
+        int(os.getenv("VLLM_KIMI_K3_MOE_TOKEN_SHARD", "0"))
+    ),
+    # With VLLM_KIMI_K3_MOE_TOKEN_SHARD: finish each MoE layer with the SM100
+    # GEMM-AR kernel on the shared down-projection, adding this rank's routed
+    # rows in its epilogue, instead of a separate all-reduce. Needs
+    # VLLM_KIMI_K3_GEMM_AR (the GEMM-AR workspace).
+    "VLLM_KIMI_K3_MOE_TOKEN_SHARD_GEMM_AR": lambda: bool(
+        int(os.getenv("VLLM_KIMI_K3_MOE_TOKEN_SHARD_GEMM_AR", "0"))
+    ),
+    # Smallest step (tokens, after CUDA-graph padding) that takes the fused
+    # GEMM-AR path above. Smaller steps keep the separate all-reduce, which is
+    # faster there: on a TP8 prefill worker the fused path cost ~+2 ms per
+    # 128-token step and saved ~1 ms per 384-token step.
+    "VLLM_KIMI_K3_MOE_TOKEN_SHARD_GEMM_AR_MIN_TOKENS": lambda: int(
+        os.getenv("VLLM_KIMI_K3_MOE_TOKEN_SHARD_GEMM_AR_MIN_TOKENS", "288")
+    ),
+    # Kimi K3 dense / shared-expert MLPs: SiTU-and-mul through the vectorized
+    # kernel (ops/situ_and_mul.py; bitwise equal to the CUDA op for every input,
+    # ~2x faster at prefill sizes).
+    "VLLM_KIMI_K3_VEC_SITU": lambda: bool(int(os.getenv("VLLM_KIMI_K3_VEC_SITU", "0"))),
+    # Kimi K3 GEMM-AR (o_proj and the token-shard MoE): return the reduced
+    # output as a view of the GEMM-AR workspace instead of copying it out; the
+    # AttnRes block-write layers copy what they keep. Bitwise (aliasing only).
+    "VLLM_KIMI_K3_GEMM_AR_ALIAS": lambda: bool(
+        int(os.getenv("VLLM_KIMI_K3_GEMM_AR_ALIAS", "0"))
+    ),
     # Kimi K3 only, and unrelated to the MoE flags above. Tap the pre-norm
     # AttnRes mixture, rather than the post-mixture sum, as the auxiliary
     # hidden state handed to a DFlash drafter. This changes the numerics the
@@ -1906,6 +1948,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ENABLE_CUDAGRAPH_GC": lambda: bool(
         int(os.getenv("VLLM_ENABLE_CUDAGRAPH_GC", "0"))
     ),
+    # Whether EC/KV consumers automatically accept pre-computed-embedding inputs
+    # (the default). Set 0 on a consumer that never receives multimodal requests
+    # (e.g. text-only disaggregated serving of a multimodal checkpoint): the model
+    # runner then keeps the input embedding inside its CUDA graphs instead of
+    # running it, with its tensor-parallel all-reduce, before every replay.
+    "VLLM_MM_EMBEDS_ON_CONSUMERS": lambda: bool(
+        int(os.getenv("VLLM_MM_EMBEDS_ON_CONSUMERS", "1"))
+    ),
     # Used to force set up loopback IP
     "VLLM_LOOPBACK_IP": lambda: os.getenv("VLLM_LOOPBACK_IP", ""),
     # Used to set the process name prefix for vLLM processes.
@@ -2133,6 +2183,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_USE_V2_MODEL_RUNNER": lambda: maybe_convert_bool(
         os.getenv("VLLM_USE_V2_MODEL_RUNNER", None)
     ),
+    # v2 model runner: send a new request's token ids to the workers only from
+    # its first uncomputed position, when no worker-side reader of earlier
+    # positions is active (see vllm.v1.core.sched.output.trim_new_request_data).
+    "VLLM_TRIM_NEW_REQUEST_TOKEN_IDS": lambda: bool(
+        int(os.getenv("VLLM_TRIM_NEW_REQUEST_TOKEN_IDS", "1"))
+    ),
     # Log model inspection after loading.
     # If enabled, logs a transformers-style hierarchical view of the model
     # with quantization methods and attention backends.
@@ -2337,6 +2393,7 @@ def compile_factors() -> dict[str, object]:
     hash everything else. This keeps the cache key aligned across workers."""
     ignored_factors: set[str] = {
         "MAX_JOBS",
+        "VLLM_TRIM_NEW_REQUEST_TOKEN_IDS",
         "VLLM_TRITON_JIT_WARMUP_NUM_THREADS",
         "VLLM_RPC_BASE_PATH",
         "VLLM_USE_MODELSCOPE",

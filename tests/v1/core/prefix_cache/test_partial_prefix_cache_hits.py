@@ -17,6 +17,7 @@ from vllm.model_executor.layers.mamba.checkpoint import (
     compute_mamba_prefill_checkpoints,
 )
 from vllm.utils.hashing import sha256
+from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_utils import (
     KVCacheBlockCopy,
     get_block_hash,
@@ -33,7 +34,9 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     SlidingWindowSpec,
     get_mamba_prefill_checkpoint_position,
+    is_mamba_prefill_checkpoint_valid,
 )
+from vllm.v1.request import RequestStatus
 
 
 @pytest.fixture(autouse=True)
@@ -103,6 +106,9 @@ def make_full_mamba_manager(
     use_eagle: bool = False,
     num_speculative_blocks: int = 0,
     num_prefill_checkpoint_blocks: int = 0,
+    retention_interval: int | None = None,
+    prefill_snapshot: bool = False,
+    max_model_len: int = 8192,
 ):
     mamba_group = KVCacheGroupSpec(
         ["mamba"],
@@ -116,6 +122,7 @@ def make_full_mamba_manager(
             prefill_checkpoint_alignment=(
                 16 if num_prefill_checkpoint_blocks > 0 else None
             ),
+            prefill_snapshot=prefill_snapshot,
         ),
     )
     kv_cache_config = KVCacheConfig(
@@ -140,12 +147,13 @@ def make_full_mamba_manager(
     )
     return make_kv_cache_manager(
         kv_cache_config=kv_cache_config,
-        max_model_len=8192,
+        max_model_len=max_model_len,
         enable_caching=True,
         dcp_world_size=dcp_world_size,
         scheduler_block_size=scheduler_block_size,
         hash_block_size=hash_block_size,
         use_eagle=use_eagle,
+        retention_interval=retention_interval,
     )
 
 
@@ -430,6 +438,7 @@ def test_hybrid_mamba_align_partial_hash_hit():
         KVCacheBlockCopy(
             src_block_id=partial_mamba_block[0].block_id,
             dst_block_id=mamba_new_block_ids[0],
+            group_id=1,
         )
         in copies
     )
@@ -618,7 +627,7 @@ def test_partial_hit_then_internal_checkpoint_uses_distinct_mamba_blocks():
     assert realigned_blocks is not None
     mamba_cow_block_id = realigned_blocks.get_block_ids()[1][0]
     copies, retained = manager.take_kv_cache_block_copies()
-    assert KVCacheBlockCopy(partial_block_id, mamba_cow_block_id) in copies
+    assert KVCacheBlockCopy(partial_block_id, mamba_cow_block_id, group_id=1) in copies
     manager.block_pool.free_blocks(retained)
 
     replay.num_computed_tokens = 8
@@ -1451,6 +1460,7 @@ def test_hybrid_mamba_partial_tail_owner_continue_preserves_later_hit():
         KVCacheBlockCopy(
             src_block_id=moved_block_id,
             dst_block_id=mamba_new_block_ids[0],
+            group_id=1,
         )
         in copies
     )
@@ -1584,6 +1594,9 @@ def test_hybrid_full_attention_partial_hash_hit_uses_cow():
         KVCacheBlockCopy(
             src_block_id=partial_full_block[0].block_id,
             dst_block_id=full_new_block_ids[0],
+            group_id=0,
+            # Only the 6 - 4 = 2 hit tokens of the shared tail block are copied.
+            num_tokens=2,
         )
         in copies
     )
@@ -2438,9 +2451,22 @@ def test_hybrid_partial_hash_hit_uses_cow_under_dcp(dcp_world_size: int):
     full_new_block_id = new_blocks.get_block_ids()[0][0]
     mamba_new_block_id = new_blocks.get_block_ids()[1][0]
     copies, retained = manager.take_kv_cache_block_copies()
-    assert KVCacheBlockCopy(partial_full_block[0].block_id, full_new_block_id) in copies
+    # The attention copy is bounded to the hit tokens in its (DCP-wide) block;
+    # the Mamba state is copied whole.
     assert (
-        KVCacheBlockCopy(partial_mamba_block[0].block_id, mamba_new_block_id) in copies
+        KVCacheBlockCopy(
+            partial_full_block[0].block_id,
+            full_new_block_id,
+            group_id=0,
+            num_tokens=6 % (physical_block_size * dcp_world_size),
+        )
+        in copies
+    )
+    assert (
+        KVCacheBlockCopy(
+            partial_mamba_block[0].block_id, mamba_new_block_id, group_id=1
+        )
+        in copies
     )
     manager.block_pool.free_blocks(retained)
 
@@ -2485,7 +2511,15 @@ def test_dcp_partial_hit_resumes_on_replicated_mamba_snapshot(
     assert new_blocks is not None
     full_new_block_id = new_blocks.get_block_ids()[0][0]
     copies, retained = manager.take_kv_cache_block_copies()
-    assert KVCacheBlockCopy(partial_full_block.block_id, full_new_block_id) in copies
+    assert (
+        KVCacheBlockCopy(
+            partial_full_block.block_id,
+            full_new_block_id,
+            group_id=0,
+            num_tokens=12 % (block_size * dcp_world_size),
+        )
+        in copies
+    )
     assert all(
         copy.src_block_id != computed_blocks.blocks[1][-1].block_id for copy in copies
     )
@@ -2859,3 +2893,276 @@ def test_checkpoint_reservation_matches_worker(
         request.num_computed_tokens = end
         manager.new_step_starts()
         start = end
+
+
+@pytest.mark.parametrize(
+    ("retention_interval", "use_eagle", "owner_len", "prompt_len", "checkpoint"),
+    [
+        # Dense retention publishes every full block the chunk crosses.
+        (None, False, 81, 300, 288),
+        # Semantic retention keeps the full block below the prompt checkpoint,
+        # which is the initial-state block when the checkpoint lands one block
+        # past it.
+        (0, True, 100, 200, 176),
+    ],
+)
+def test_internal_checkpoint_from_mid_block_hit_keeps_initial_state_unpublished(
+    retention_interval, use_eagle, owner_len, prompt_len, checkpoint
+):
+    """A prefill resuming mid-block from a partial hit can run past the next
+    block boundary in one chunk when the backend exports the prompt checkpoint
+    internally. The worker pre-copies the resumed state into the running
+    column, so the initial-state column still holds state@resume afterwards.
+    Publishing it as that block's full-block state (state@block end) would let
+    a later request resume from the wrong Mamba state.
+    """
+    hash_block_size = 16
+    mamba_block_size = 64
+    resume = 80  # inside mamba block 1
+    manager = make_full_mamba_manager(
+        dcp_world_size=1,
+        hash_block_size=hash_block_size,
+        full_block_size=hash_block_size,
+        mamba_block_size=mamba_block_size,
+        num_prefill_checkpoint_blocks=1,
+        num_blocks=64,
+        use_eagle=use_eagle,
+        retention_interval=retention_interval,
+    )
+
+    owner = make_request("owner", list(range(owner_len)), hash_block_size, sha256)
+    computed_blocks, num_computed, _ = manager.get_computed_blocks(owner)
+    assert manager.allocate_slots(owner, owner_len, num_computed, computed_blocks)
+    manager.free(owner)
+    manager.new_step_starts()
+    drain_boundary_state_offloads(manager)
+
+    replay = make_request("replay", list(range(prompt_len)), hash_block_size, sha256)
+    computed_blocks, num_computed, _ = manager.get_computed_blocks(replay)
+    assert num_computed == resume
+    assert checkpoint == get_mamba_prefill_checkpoint_position(
+        prompt_len, hash_block_size, drop_eagle_block=use_eagle
+    )
+    # The internal checkpoint is valid, so one chunk covers the rest of the
+    # prompt and crosses the block boundary at 128.
+    assert is_mamba_prefill_checkpoint_valid(
+        query_start=resume,
+        query_end=prompt_len,
+        checkpoint_position=checkpoint,
+        hash_block_size=hash_block_size,
+        mamba_block_size=mamba_block_size,
+        checkpoint_alignment=16,
+    )
+    assert manager.allocate_slots(
+        replay, prompt_len - resume, num_computed, computed_blocks
+    )
+    manager.new_step_starts()
+
+    mamba_blocks = manager.get_blocks(replay.request_id).blocks[1]
+    initial_state_block = mamba_blocks[(resume - 1) // mamba_block_size]
+    # The initial-state column holds the resumed state@80 (its CoW copy), not
+    # state@128.
+    assert initial_state_block.block_hash is None
+    offloads = drain_boundary_state_offloads(manager).get(replay.request_id, [])
+    assert all(block_id != initial_state_block.block_id for _, block_id, _ in offloads)
+
+    # A request diverging between 128 and the prompt checkpoint resumes at a
+    # state that was actually computed there, never at 128.
+    rewind = make_request(
+        "rewind", list(range(160)) + [9999] * 40, hash_block_size, sha256
+    )
+    _, num_computed, _ = manager.get_computed_blocks(rewind)
+    assert num_computed != 2 * mamba_block_size
+
+
+class _AlignModel:
+    """Scheduler split + KV cache manager + a CPU model of the worker's align-mode
+    Mamba state: CoW copies, the pre-copy into the running column, the internal
+    checkpoint export (``compute_mamba_prefill_checkpoints``) and the in-place
+    update. Tracks which token count each mamba block's state is at."""
+
+    def __init__(self, *, snapshot: bool, num_spec: int = 3, block: int = 896):
+        self.hash, self.block, self.snapshot = 128, block, snapshot
+        self.manager = make_full_mamba_manager(
+            dcp_world_size=1,
+            hash_block_size=self.hash,
+            full_block_size=self.hash,
+            mamba_block_size=block,
+            num_blocks=8192,
+            use_eagle=True,
+            num_speculative_blocks=num_spec,
+            num_prefill_checkpoint_blocks=1,
+            retention_interval=0,
+            prefill_snapshot=snapshot,
+            max_model_len=65536,
+        )
+        self.state: dict[int, int] = {}
+        self.tables: dict[str, list[int]] = {}
+        self.running_col: dict[str, int] = {}
+        self.offloads: dict[str, list[int]] = {}
+
+    def split(self, request, start, num_new, local, first):
+        stub = SimpleNamespace(
+            cache_config=SimpleNamespace(
+                block_size=self.block, mamba_extra_tail_checkpoint_min_span=0
+            ),
+            use_eagle_block_drop=True,
+            max_num_scheduled_tokens=16384,
+            scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
+            mamba_partial_cache_hit=True,
+            mamba_shared_prefix_checkpoint=False,
+            hash_block_size=self.hash,
+            mamba_has_prefill_checkpoint_blocks=True,
+            mamba_prefill_checkpoint_alignment=16,
+            mamba_internal_snapshot=self.snapshot,
+        )
+        return Scheduler._mamba_block_aligned_split(
+            stub, request, num_new, local, first_chunk=first
+        )
+
+    def step(self, request, budget=1 << 30):
+        rid = request.request_id
+        first = rid not in self.tables
+        blocks, local = None, 0
+        if first:
+            blocks, local, _ = self.manager.get_computed_blocks(request)
+        start = request.num_computed_tokens + local
+        num_new = self.split(
+            request, start, min(request.num_tokens - start, budget), local, first
+        )
+        assert num_new > 0
+        new = self.manager.allocate_slots(request, num_new, local, blocks)
+        assert new is not None
+        end = start + num_new
+        mamba = self.manager.get_blocks(rid).blocks[1]
+        if first:
+            self.tables[rid] = [b.block_id for b in mamba]
+            prev = (start - 1) // self.block
+        else:
+            self.tables[rid] += new.get_block_ids()[1]
+            prev = self.running_col[rid]
+        table = self.tables[rid]
+        for r, offs in self.manager.take_boundary_state_offloads().items():
+            self.offloads.setdefault(r, []).extend(t for _, _, t in offs)
+        copies, retained = self.manager.take_kv_cache_block_copies()
+        for c in copies:
+            if c.group_id == 1:
+                self.state[c.dst_block_id] = self.state.get(c.src_block_id)
+        self.manager.block_pool.free_blocks(retained)
+        cur = cdiv(end, self.block) - 1
+        if 0 <= prev != cur:
+            self.state[table[cur]] = self.state.get(table[prev])
+        offsets, cols = compute_mamba_prefill_checkpoints(
+            [end],
+            [num_new],
+            hash_block_size=self.hash,
+            mamba_block_size=self.block,
+            checkpoint_alignment=16,
+            drop_eagle_block=True,
+            cache_hit_alignment_tokens=self.hash,
+            first_chunk=[first] if self.snapshot else None,
+        )
+        if offsets[0] and table[cols[0]] != 0:
+            self.state[table[cols[0]]] = start + offsets[0]
+        self.state[table[cur]] = end
+        self.running_col[rid] = cur
+        request.num_computed_tokens = end
+        request.status = RequestStatus.RUNNING
+        self.manager.new_step_starts()
+        return start, end
+
+    def prefill(self, request, budgets=()):
+        spans: list[tuple[int, int]] = []
+        while request.num_computed_tokens < request.num_tokens:
+            budget = budgets[len(spans)] if len(spans) < len(budgets) else 1 << 30
+            spans.append(self.step(request, budget))
+        return spans
+
+    def stale_blocks(self):
+        """Hashed mamba blocks whose state is not at the position they claim."""
+        return [
+            (b.block_id, b.block_hash_num_tokens, self.state.get(b.block_id))
+            for b in self.manager.block_pool.blocks
+            if not b.is_null
+            and b.block_hash is not None
+            and get_group_id(b.block_hash) == 1
+            and self.state.get(b.block_id) != b.block_hash_num_tokens
+        ]
+
+
+_SMALL_TURNS = [300, 700, 150, 1200, 900, 1700, 450, 2600, 60, 800]
+
+
+def _conversation(model, budgets=None):
+    tokens = list(range(1, 5001))
+    rows = []
+    for i, n in enumerate(_SMALL_TURNS):
+        tokens = tokens + list(range(100000 * (i + 1), 100000 * (i + 1) + n))
+        request = make_request(f"turn{i}", list(tokens), model.hash, sha256)
+        spans = model.prefill(request, (budgets or {}).get(i, ()))
+        rows.append((len(tokens), spans[0][0], len(spans)))
+        model.manager.free(request)
+        model.manager.new_step_starts()
+    return rows
+
+
+@pytest.mark.parametrize("num_spec", [0, 3])
+def test_first_chunk_snapshot_prefills_small_turns_in_one_step(num_spec):
+    """Each small turn of a conversation resumes at the previous turn's prompt
+    checkpoint either way; with the snapshot it prefills in one step, every
+    cached Mamba state is at the position its hash claims, and the turn's
+    checkpoint is offered to the connector."""
+    base = _AlignModel(snapshot=False, num_spec=num_spec)
+    snap = _AlignModel(snapshot=True, num_spec=num_spec)
+    rows_base = _conversation(base)
+    rows_snap = _conversation(snap)
+    # Same resume points (each turn hits the previous turn's checkpoint).
+    assert [r[:2] for r in rows_base] == [r[:2] for r in rows_snap]
+    for (n_prev, _, _), (_, hit, _) in zip(rows_snap, rows_snap[1:]):
+        assert hit == get_mamba_prefill_checkpoint_position(n_prev, 128, True)
+    assert all(steps == 1 for _, _, steps in rows_snap)
+    assert sum(steps for _, _, steps in rows_base) > len(rows_base)
+    assert base.stale_blocks() == []
+    assert snap.stale_blocks() == []
+    for i, (n, _, _) in enumerate(rows_snap):
+        checkpoint = get_mamba_prefill_checkpoint_position(n, 128, True)
+        assert checkpoint in snap.offloads[f"turn{i}"]
+
+
+def test_first_chunk_snapshot_never_serves_a_running_request():
+    """A turn whose first chunk is budget-limited reaches its tail as a running
+    request: it keeps today's split there (the worker's table is append-only),
+    and the cached states stay exact."""
+    # Turn 1 reaches its tail at a block boundary one block short of the end
+    # (the snapshot geometry, but running); turn 5 then crosses two boundaries.
+    budgets = {1: [300], 5: [1000]}
+    base = _AlignModel(snapshot=False)
+    snap = _AlignModel(snapshot=True)
+    rows_base = _conversation(base, budgets)
+    rows_snap = _conversation(snap, budgets)
+    assert [r[:2] for r in rows_base] == [r[:2] for r in rows_snap]
+    for i in budgets:
+        assert rows_snap[i][2] == rows_base[i][2] > 1
+    assert snap.stale_blocks() == []
+
+
+def test_first_chunk_snapshot_block_retires_after_the_step():
+    """The snapshot block sits below the running state: the next step's
+    remove_skipped_blocks releases it to the cache like any checkpoint."""
+    model = _AlignModel(snapshot=True, num_spec=0)
+    owner = make_request("owner", list(range(1, 2001)), 128, sha256)
+    model.prefill(owner)
+    model.manager.free(owner)
+    model.manager.new_step_starts()
+    turn = make_request("turn", list(range(1, 2001)) + [7] * 500, 128, sha256)
+    assert model.prefill(turn) == [(1792, 2500)]
+    mamba = model.manager.get_blocks(turn.request_id).blocks[1]
+    checkpoint = get_mamba_prefill_checkpoint_position(2500, 128, True)
+    snapshot = mamba[(1792 - 1) // 896 - 1]
+    assert not snapshot.is_null and snapshot.block_hash_num_tokens == checkpoint
+    assert snapshot.ref_cnt == 1
+    # A decode step: the snapshot column is retired (still cached).
+    turn.append_output_token_ids(11)
+    assert model.manager.allocate_slots(turn, 1) is not None
+    assert model.manager.get_blocks(turn.request_id).blocks[1][1].is_null
+    assert snapshot.ref_cnt == 0 and snapshot.block_hash_num_tokens == checkpoint

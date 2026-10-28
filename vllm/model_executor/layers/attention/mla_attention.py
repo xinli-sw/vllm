@@ -201,6 +201,7 @@ return curr_o @ W_O
 import functools
 import itertools
 import math
+import os
 from abc import abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -2010,6 +2011,20 @@ def align_mla_chunked_context_workspace_size(
     return round_up(max(workspace_size, alignment), alignment)
 
 
+def mla_dcp_context_chunk_tokens(vllm_config: VllmConfig, workspace_size: int) -> int:
+    """Context rows per DCP chunk for layers that gather into their own buffers.
+
+    VLLM_MLA_DCP_CONTEXT_CHUNK_TOKENS (0 = off) raises the chunk above the
+    chunked-prefill workspace size; only builders whose attention layer sets
+    ``supports_large_dcp_context_chunks`` (it then owns buffers of that size,
+    allocated before the memory profile) plan with it.
+    """
+    override = int(os.environ.get("VLLM_MLA_DCP_CONTEXT_CHUNK_TOKENS", "0"))
+    return align_mla_chunked_context_workspace_size(
+        vllm_config, max(override, workspace_size)
+    )
+
+
 def build_mla_chunked_context_metadata(
     *,
     context_lens_cpu: torch.Tensor,
@@ -2457,6 +2472,10 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                 self.chunked_prefill_workspace,
                 self.chunked_prefill_workspace_size,
             )
+            if getattr(attention_layer, "supports_large_dcp_context_chunks", False):
+                self.dcp_context_plan_size = mla_dcp_context_chunk_tokens(
+                    vllm_config, self.chunked_prefill_workspace_size
+                )
         else:
             self.chunked_prefill_workspace = torch.empty(
                 (
@@ -2619,7 +2638,9 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                 context_lens_cpu=context_lens_cpu,
                 prefill_query_start_loc_cpu=prefill_query_start_loc_cpu,
                 chunked_prefill_workspace=self.chunked_prefill_workspace,
-                chunked_prefill_workspace_size=self.chunked_prefill_workspace_size,
+                chunked_prefill_workspace_size=getattr(
+                    self, "dcp_context_plan_size", self.chunked_prefill_workspace_size
+                ),
                 block_size=self.page_size,
                 align_chunk_to_block=True,
                 device=device,

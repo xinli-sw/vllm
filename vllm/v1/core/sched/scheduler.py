@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import replace
+from importlib.metadata import entry_points
 from typing import Any
 
+from vllm import envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import KVEventsConfig, VllmConfig
 from vllm.distributed.aux_output_connector.connector import AuxOutputSchedulerConnector
@@ -46,6 +49,7 @@ from vllm.v1.core.sched.output import (
     NewRequestData,
     ScheduledEncoderInputStats,
     SchedulerOutput,
+    trim_new_request_data,
 )
 from vllm.v1.core.sched.request_queue import (
     RequestQueue,
@@ -57,7 +61,9 @@ from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutp
 from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
     MambaSpec,
+    get_mamba_extra_tail_checkpoint_position,
     get_mamba_prefill_checkpoint_position,
+    get_mamba_prefill_snapshot_col,
     is_mamba_prefill_checkpoint_valid,
 )
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
@@ -72,6 +78,7 @@ from vllm.v1.metrics.stats import (
 )
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
+from vllm.v1.sample.logits_processor import LOGITSPROCS_GROUP
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
@@ -79,6 +86,44 @@ from vllm.v1.structured_output.utils import strip_speculative_padding
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+
+# A waiting request whose KV connector lookup stays pending this long is
+# admitted without the external hit (recomputed), so a stalled lookup can never
+# hold it forever.
+KV_CONNECTOR_LOOKUP_TIMEOUT_S = float(
+    os.getenv("VLLM_KV_CONNECTOR_LOOKUP_TIMEOUT_S", "10")
+)
+# WAITING_FOR_REMOTE_KVS for this long logs a warning (the load cannot be
+# abandoned: a late transfer may still write the request's blocks).
+KV_CONNECTOR_LOAD_WARN_S = 60.0
+
+
+def new_req_token_trim_supported(vllm_config: VllmConfig) -> bool:
+    """Whether new requests may ship only the token ids v2 workers read.
+
+    False when an engine-wide worker-side reader of a request's earlier token
+    ids may be active: M-RoPE position setup, n-gram drafting, watermarking and
+    custom logits processors (configured or installed as plugins). The
+    per-request readers are checked by `trim_new_request_data`.
+    """
+    if not envs.VLLM_TRIM_NEW_REQUEST_TOKEN_IDS:
+        return False
+    model_config = vllm_config.model_config
+    speculative_config = vllm_config.speculative_config
+    return not (
+        model_config.uses_mrope
+        or getattr(vllm_config, "watermark_config", None) is not None
+        or (
+            speculative_config is not None
+            and speculative_config.method in ("ngram", "ngram_gpu")
+        )
+        or bool(model_config.logits_processors)
+        or len(entry_points(group=LOGITSPROCS_GROUP)) > 0
+    )
+
+
+def _log_bucket(n: int) -> int:
+    return n.bit_length() if n < 1024 else 10 + n // 1024
 
 
 class Scheduler(SchedulerInterface):
@@ -142,6 +187,11 @@ class Scheduler(SchedulerInterface):
         self.adaptive_long_prefill_threshold = (
             self.scheduler_config.long_prefill_token_threshold_adaptive
         )
+        # request id -> time its KV connector lookup was first found pending.
+        self._connector_lookup_pending_since: dict[str, float] = {}
+        self._connector_lookup_timed_out: set[str] = set()
+        # request id -> time it entered WAITING_FOR_REMOTE_KVS (warn once).
+        self._remote_kv_wait_since: dict[str, float] = {}
         self.max_model_len = vllm_config.model_config.max_model_len
         self.enable_kv_cache_events = (
             self.kv_events_config is not None
@@ -343,6 +393,16 @@ class Scheduler(SchedulerInterface):
             enable_mamba_shared_prefix_checkpoint=(
                 self.cache_config.enable_mamba_shared_prefix_checkpoint
             ),
+            mamba_low_priority_snapshot_prompt_len=(
+                self.cache_config.mamba_low_priority_snapshot_prompt_len
+            ),
+            mamba_conversation_max_turns=(
+                self.cache_config.mamba_conversation_max_turns
+            ),
+            prefix_cache_policy=self.cache_config.prefix_cache_policy,
+            mamba_conversation_max_turns_mode=(
+                self.cache_config.mamba_conversation_max_turns_mode
+            ),
         )
         # Mamba managers already account for their speculative state blocks.
         num_spec_decode_tokens = (
@@ -361,6 +421,11 @@ class Scheduler(SchedulerInterface):
 
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
         self.use_v2_model_runner = vllm_config.use_v2_model_runner
+        # v2 model runner: a new request ships its token ids to the workers
+        # only from the first position they read (`trim_new_request_data`).
+        self.trim_new_req_token_ids = new_req_token_trim_supported(vllm_config)
+        self.num_new_reqs_trimmed = 0
+        self.num_new_reqs_untrimmed = 0
         # Scheduler iteration counter. Drives the V2+PP+async decode-throttle
         # cadence (`next_decode_eligible_step`).
         self.current_step = 0
@@ -392,6 +457,30 @@ class Scheduler(SchedulerInterface):
             or group.kv_cache_spec.num_prefill_checkpoint_blocks > 0
             for group in kv_cache_config.kv_cache_groups
         )
+        # CacheConfig.mamba_internal_snapshot: a request's first chunk may also
+        # export its prompt checkpoint when it crosses at most one mamba block
+        # boundary, into a fresh block below its initial state. Every mamba
+        # group's backend must declare the snapshot column.
+        self.mamba_internal_snapshot = (
+            self.cache_config.mamba_internal_snapshot
+            and self.has_mamba_layers
+            and self.cache_config.mamba_cache_mode == "align"
+            and self.mamba_has_prefill_checkpoint_blocks
+            and all(
+                not isinstance(group.kv_cache_spec, MambaSpec)
+                or group.kv_cache_spec.prefill_snapshot
+                for group in kv_cache_config.kv_cache_groups
+            )
+        )
+        if (
+            self.cache_config.mamba_internal_snapshot
+            and not self.mamba_internal_snapshot
+        ):
+            logger.warning_once(
+                "mamba_internal_snapshot is ignored: it needs Mamba prefix caching "
+                "in align mode, the V2 model runner and a backend that declares the "
+                "prefill snapshot (FlashKDA)."
+            )
         # Fine-grained hits reuse the prompt's hash-aligned Mamba checkpoint.
         # Split there only if the backend cannot save it within the final chunk.
         self.mamba_partial_cache_hit = (
@@ -406,6 +495,15 @@ class Scheduler(SchedulerInterface):
         self.mamba_shared_prefix_checkpoint = (
             self.mamba_partial_cache_hit
             and self.kv_cache_manager.mamba_shared_prefix_checkpoint
+        )
+        # Opt-in: also end a chunk at a block-aligned checkpoint shortly before
+        # the prompt tail (0 = off), for requests that later diverge a little
+        # before this prompt's end.
+        self.mamba_extra_tail_checkpoint_tokens = (
+            self.cache_config.mamba_extra_tail_checkpoint_tokens
+            if self.need_mamba_block_aligned_split
+            and self.cache_config.enable_prefix_caching
+            else 0
         )
 
         # Counts of non-empty steps scheduled / processed. update_from_output
@@ -446,8 +544,13 @@ class Scheduler(SchedulerInterface):
         num_new_tokens: int,
         num_new_local_computed_tokens: int = 0,
         num_external_computed_tokens: int = 0,
+        first_chunk: bool = False,
     ) -> int:
         """Clip a prefill chunk so it ends where Mamba state must be cached.
+
+        ``first_chunk``: the request is scheduled from the waiting queue, so
+        the worker receives its whole block table this step (the only case the
+        first-chunk snapshot may serve, CacheConfig.mamba_internal_snapshot).
 
         In "align" cache mode reusable SSM states are materialized at block
         boundaries, plus mandatory early stops (the prompt's partial-tail hash
@@ -480,6 +583,26 @@ class Scheduler(SchedulerInterface):
         )
 
         end = start + num_new_tokens
+        extra_tail_tokens = getattr(self, "mamba_extra_tail_checkpoint_tokens", 0)
+        if extra_tail_tokens:
+            if request.mamba_extra_checkpoint is None:
+                # Decided once, at the first prefill chunk, from its resume point.
+                request.mamba_extra_checkpoint = (
+                    get_mamba_extra_tail_checkpoint_position(
+                        request.num_prompt_tokens,
+                        start,
+                        self.hash_block_size,
+                        block_size,
+                        self.use_eagle_block_drop,
+                        extra_tail_tokens,
+                        self.cache_config.mamba_extra_tail_checkpoint_min_span,
+                    )
+                )
+            if start < request.mamba_extra_checkpoint < end:
+                # Never run past the extra checkpoint. The chunk is then not the
+                # prompt's last, so the rules below treat it as an intermediate
+                # chunk (block-aligned end, no internal tail checkpoint).
+                end = request.mamba_extra_checkpoint
         checkpoint_position = get_mamba_prefill_checkpoint_position(
             prefill_end,
             ckpt_block_size,
@@ -497,6 +620,25 @@ class Scheduler(SchedulerInterface):
                 checkpoint_alignment=self.mamba_prefill_checkpoint_alignment,
             )
         )
+        if (
+            not use_internal_checkpoint
+            and first_chunk
+            and getattr(self, "mamba_internal_snapshot", False)
+            and end >= prefill_end
+        ):
+            # A small turn: the chunk crosses at most one block boundary, so the
+            # checkpoint goes to the snapshot column below the initial state.
+            use_internal_checkpoint = (
+                get_mamba_prefill_snapshot_col(
+                    query_start=start,
+                    query_end=end,
+                    checkpoint_position=checkpoint_position,
+                    hash_block_size=self.hash_block_size,
+                    mamba_block_size=block_size,
+                    checkpoint_alignment=self.mamba_prefill_checkpoint_alignment,
+                )
+                >= 0
+            )
         if use_internal_checkpoint:
             last_cache_position = 0
         # Invariant: slot p holds the state after exactly (p + 1) * block_size
@@ -984,11 +1126,34 @@ class Scheduler(SchedulerInterface):
                             ext_tokens, load_kv_async = 0, False
 
                         if ext_tokens is None:
-                            # The request cannot be scheduled because
-                            # the KVConnector couldn't determine
-                            # the number of matched tokens.
-                            skip_request(request_queue)
-                            continue
+                            pending_since = (
+                                self._connector_lookup_pending_since.setdefault(
+                                    request_id, time.monotonic()
+                                )
+                            )
+                            waited = time.monotonic() - pending_since
+                            if waited < KV_CONNECTOR_LOOKUP_TIMEOUT_S:
+                                # The request cannot be scheduled because
+                                # the KVConnector couldn't determine
+                                # the number of matched tokens.
+                                skip_request(request_queue)
+                                continue
+                            # Bounded wait: admit without the external hit.
+                            if request_id not in self._connector_lookup_timed_out:
+                                self._connector_lookup_timed_out.add(request_id)
+                                logger.warning(
+                                    "KV connector lookup for request %s pending "
+                                    "for %.1f s; recomputing without the "
+                                    "external hit.",
+                                    request_id,
+                                    waited,
+                                )
+                            # Keep the mark: until the lookup resolves, later
+                            # admission attempts fall back at once.
+                            ext_tokens, load_kv_async = 0, False
+                        else:
+                            self._connector_lookup_pending_since.pop(request_id, None)
+                            self._connector_lookup_timed_out.discard(request_id)
 
                         if self.prefix_replay_tokens and not (
                             ext_tokens and self._load_restores_replay_window(request)
@@ -1176,6 +1341,13 @@ class Scheduler(SchedulerInterface):
                             num_new_tokens,
                             num_new_local_computed_tokens,
                             num_external_computed_tokens,
+                            # Only the snapshot reads it; flag off, the call is
+                            # unchanged.
+                            **(
+                                {"first_chunk": True}
+                                if self.mamba_internal_snapshot
+                                else {}
+                            ),
                         )
                         if num_new_tokens == 0:
                             break
@@ -1546,6 +1718,11 @@ class Scheduler(SchedulerInterface):
         # Connector-only block state must not be dispatched to workers.
         scheduler_output.kv_connector_block_state = None
 
+        # After every engine-side consumer of the full new-request data. The
+        # V1 model runner reads the prompt list; only v2 workers are trimmed.
+        if self.use_v2_model_runner and self.trim_new_req_token_ids and new_reqs_data:
+            self._trim_new_reqs_for_workers(new_reqs_data, scheduled_new_reqs)
+
         # Advance the fence only for non-empty steps (those that actually
         # write KV and have their output processed later in update_from_output).
         if self.defer_block_free and total_num_scheduled_tokens > 0:
@@ -1554,6 +1731,28 @@ class Scheduler(SchedulerInterface):
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
         return scheduler_output
+
+    def _trim_new_reqs_for_workers(
+        self, new_reqs_data: list[NewRequestData], requests: list[Request]
+    ) -> None:
+        """Ship new requests' token ids to the workers from the first position
+        they read on: the engine pickles and every worker unpickles and stages
+        whatever the step's data holds, in the step's critical path."""
+        num_before = self.num_new_reqs_trimmed + self.num_new_reqs_untrimmed
+        for new_req, request in zip(new_reqs_data, requests, strict=True):
+            if trim_new_request_data(new_req, request):
+                self.num_new_reqs_trimmed += 1
+            else:
+                self.num_new_reqs_untrimmed += 1
+        num_after = self.num_new_reqs_trimmed + self.num_new_reqs_untrimmed
+        # Log at 1, 2, 4, ..., 1024 new requests, then every 1024.
+        if _log_bucket(num_before) != _log_bucket(num_after):
+            logger.info(
+                "New requests sent to the workers: %d with only their uncomputed "
+                "token ids, %d with all of them.",
+                self.num_new_reqs_trimmed,
+                self.num_new_reqs_untrimmed,
+            )
 
     def _build_kv_connector_meta(
         self, connector: KVConnectorBase_V1, scheduler_output: SchedulerOutput
@@ -2635,6 +2834,7 @@ class Scheduler(SchedulerInterface):
                 request.streaming_queue = deque()
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
+            self.kv_cache_manager.prepare_conversation_turn(request)
             if self.spec_decode_metrics_level != "none":
                 request.spec_decode_metrics = RequestSpecDecodeMetrics.new(
                     self.num_spec_tokens
@@ -2722,6 +2922,10 @@ class Scheduler(SchedulerInterface):
         if self.aux_output_connector is not None:
             self.aux_output_connector.request_finished(request)
         self._inflight_prefills.discard(request)
+        self._connector_lookup_pending_since.pop(request.request_id, None)
+        self._connector_lookup_timed_out.discard(request.request_id)
+        self._remote_kv_wait_since.pop(request.request_id, None)
+        self.kv_cache_manager.finish_conversation_turn(request)
         self._set_kv_fetch_stage(request, None)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
 
@@ -3183,7 +3387,19 @@ class Scheduler(SchedulerInterface):
             request_id = request.request_id
             if request_id not in self.finished_recving_kv_req_ids:
                 logger.debug("%s is still in WAITING_FOR_REMOTE_KVS state.", request_id)
+                now = time.monotonic()
+                since = self._remote_kv_wait_since.setdefault(request_id, now)
+                if since > 0 and now - since > KV_CONNECTOR_LOAD_WARN_S:
+                    # Warn once (a negative mark): no silent wait.
+                    self._remote_kv_wait_since[request_id] = -1.0
+                    logger.warning(
+                        "Request %s has waited %.0f s for its KV connector load "
+                        "(no finished/failed report yet).",
+                        request_id,
+                        now - since,
+                    )
                 return False
+            self._remote_kv_wait_since.pop(request_id, None)
             # Promote request to waiting or preempted.
             self._update_waiting_for_remote_kv(request)
             if request.num_preemptions:

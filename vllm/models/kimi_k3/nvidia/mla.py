@@ -32,12 +32,14 @@ Out of scope (extension points, not wired here): prefill context parallelism
 """
 
 import math
+import os
 from typing import TYPE_CHECKING, cast
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
+import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import (
@@ -77,7 +79,9 @@ from vllm.model_executor.layers.quantization import (
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding, get_rope
 from vllm.model_executor.utils import replace_parameter
 from vllm.models.common.ops import fused_q_kv_rmsnorm
+from vllm.models.kimi_k3.nvidia import dcp_context
 from vllm.models.kimi_k3.nvidia.low_latency_gemm import try_low_latency_gemm
+from vllm.models.kimi_k3.nvidia.ops import mla_qkv_norm, mla_qkv_quant
 from vllm.models.kimi_k3.nvidia.ops.fused_mla_key_concat_kv_cache import (
     fused_mla_decode_q_concat_kv_cache_insert,
     fused_mla_key_concat_ds_mla_insert,
@@ -105,9 +109,24 @@ from vllm.v1.attention.selector import get_attn_backend
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec, get_kv_quant_mode
 
 if TYPE_CHECKING:
-    from vllm.model_executor.layers.attention.mla_attention import MLACommonMetadata
+    from vllm.model_executor.layers.attention.mla_attention import (
+        MLACommonMetadata,
+        MLACommonPrefillMetadata,
+    )
 
 logger = init_logger(__name__)
+
+# VLLM_K3_MLA_QKV_NORM_ROWS=0: the common fused_q_kv_rmsnorm (one program per
+# row) for q_a / kv_a; ops/mla_qkv_norm.py is bitwise equal to it.
+_QKV_NORM_ROWS = os.environ.get("VLLM_K3_MLA_QKV_NORM_ROWS", "1") == "1"
+# VLLM_K3_MLA_QKV_QUANT_JIT=0: the _C fp8 prefill epilogue (q / k / v quant +
+# fp8 latent insert); ops/mla_qkv_quant is bitwise equal to it.
+_QKV_QUANT_JIT = os.environ.get("VLLM_K3_MLA_QKV_QUANT_JIT", "1") == "1"
+
+
+def use_qkv_quant_jit(q: torch.Tensor) -> bool:
+    return _QKV_QUANT_JIT and mla_qkv_quant.available() and mla_qkv_quant.eligible(q)
+
 
 # Below this conservative threshold, overlap the gate projection with attention
 # on the auxiliary stream.
@@ -400,6 +419,43 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             v_head_dim=self.v_head_dim,
             vllm_config=vllm_config,
         )
+        if (
+            self.dcp_manager is not None
+            and self.prefill_backend.get_name() == "TRTLLM_RAGGED"
+            and dcp_context.use_fp8_gather(self.kv_cache_dtype)
+        ):
+            # Allocate the fp8 context-gather buffers now, before the memory
+            # profile, so the KV cache planner accounts for them.
+            from vllm.model_executor.layers.attention.mla_attention import (
+                MLACommonMetadataBuilder,
+                mla_dcp_context_chunk_tokens,
+            )
+
+            rows = mla_dcp_context_chunk_tokens(
+                vllm_config,
+                MLACommonMetadataBuilder.determine_chunked_prefill_workspace_size(
+                    vllm_config
+                ),
+            )
+            device = next(self.kv_b_proj.parameters()).device
+            gather = dcp_context.init_fp8_gather(
+                self.dcp_manager,
+                rows,
+                self.kv_lora_rank + self.qk_rope_head_dim,
+                device,
+            )
+            dcp_context.init_kv_buffers(
+                gather.capacity,
+                self.num_local_heads,
+                self.qk_nope_head_dim + self.qk_rope_head_dim,
+                self.v_head_dim,
+                self.kv_lora_rank + self.qk_rope_head_dim,
+                device,
+            )
+            # The builder may plan context chunks larger than its own workspace
+            # (VLLM_MLA_DCP_CONTEXT_CHUNK_TOKENS): this layer gathers into the
+            # buffers above.
+            self.supports_large_dcp_context_chunks = True
 
         compilation_config = vllm_config.compilation_config
         if prefix in compilation_config.static_forward_context:
@@ -529,7 +585,9 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         q_c, kv_c, k_pe = qkv_lora.split(
             [q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
         )
-        q_c, kv_c_normed = fused_q_kv_rmsnorm(
+        q_c, kv_c_normed = (
+            mla_qkv_norm.fused_q_kv_rmsnorm if _QKV_NORM_ROWS else fused_q_kv_rmsnorm
+        )(
             q_c,
             kv_c,
             self.q_a_layernorm.weight.data,
@@ -634,7 +692,12 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             attn_out = _gate_sigmoid_mul(attn_out, gate)
 
         if self.gemm_rs_ar is not None and self.gemm_rs_ar.should_run(attn_out):
-            return self.gemm_rs_ar.apply(attn_out, self.o_proj)
+            # VLLM_KIMI_K3_GEMM_AR_ALIAS: hand back the workspace view; the
+            # decoder layer consumes it before the next GEMM-AR, and copies it
+            # only where it keeps it (AttnRes block-write layers).
+            return self.gemm_rs_ar.apply(
+                attn_out, self.o_proj, copy_out=not envs.VLLM_KIMI_K3_GEMM_AR_ALIAS
+            )
 
         return self.o_proj(attn_out)[0]
 
@@ -938,6 +1001,209 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             )
         return output, output_lse
 
+    def _dcp_compute_prefill_context(
+        self,
+        q: torch.Tensor,
+        attn_metadata: "MLACommonMetadata",
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """DCP chunked context without the reorg copies, at full occupancy.
+
+        Per chunk: the local gather and the DCP all-gather as in the impl's
+        loop, then ``kv_b_proj`` and the fp8 pack straight on the all-gathered
+        (rank-major) buffer, and one segmented FMHA over its (rank, request)
+        blocks (``dcp_context``). The partials fold into an fp32 running
+        partial; the returned bf16 partial is rounded once from it.
+        """
+        return self._dcp_compute_prefill_context_impl(q, attn_metadata)
+
+    def _dcp_compute_prefill_context_impl(
+        self,
+        q: torch.Tensor,
+        attn_metadata: "MLACommonMetadata",
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Only called for prefills with chunked context (both set).
+        prefill = cast("MLACommonPrefillMetadata", attn_metadata.prefill)
+        chunked_context = cast(
+            "MLACommonPrefillMetadata.ChunkedContextMetadata", prefill.chunked_context
+        )
+        backend = prefill.prefill_backend
+        fp8_prefill = q.dtype == current_platform.fp8_dtype()
+        workspace = chunked_context.workspace
+        kv_cache = self._attn_read_kv_cache()
+        world = self.dcp_world_size
+        kv_b_proj_input_dtype = _get_kv_b_proj_input_dtype(self.kv_b_proj, fp8_prefill)
+        heads, dv = self.num_local_heads, self.v_head_dim
+        num_tokens = q.shape[0]
+        query_lens_all = cast(torch.Tensor, prefill.query_lens_cpu).tolist()
+
+        acc_o = torch.empty(
+            (num_tokens, heads, dv), dtype=torch.float32, device=q.device
+        )
+        acc_lse = torch.full(
+            (num_tokens, heads), float("-inf"), dtype=torch.float32, device=q.device
+        )
+        output = torch.empty(
+            (num_tokens, heads, dv), dtype=prefill.output_dtype, device=q.device
+        )
+        output_lse = torch.empty(
+            (heads, num_tokens), dtype=torch.float32, device=q.device
+        )
+        neutralize_empty_context_partials(chunked_context, output, output_lse)
+
+        allgather_offset = workspace.shape[0] // (world + 1)
+        manager = cast(MLADCPManager, chunked_context.dcp_manager)
+        fp8_gather = (
+            dcp_context.get_fp8_gather(
+                manager, allgather_offset * world, workspace.shape[1], q.device
+            )
+            if dcp_context.use_fp8_gather(self.kv_cache_dtype)
+            else None
+        )
+        prev_plan = prev_slice = None
+        for chunk in chunked_context.chunks:
+            toks = chunk.num_local_context_tokens
+            block_table = prefill.block_table[chunk.request_slice]
+            kv_bufs = (
+                dcp_context.get_kv_buffers(
+                    toks * world,
+                    heads,
+                    self.qk_nope_head_dim + self.qk_rope_head_dim,
+                    dv,
+                    workspace.shape[1],
+                    q.device,
+                )
+                if fp8_gather is not None
+                and fp8_prefill
+                and toks * world <= fp8_gather.capacity
+                else None
+            )
+            if kv_bufs is not None:
+                # fp8 bytes over DCP; dequantized after the all-gather, per
+                # sub-block, straight into kv_b and the pack.
+                ops.cp_gather_cache(
+                    src_cache=kv_cache,
+                    # kv_bufs is only set with fp8_gather
+                    dst=fp8_gather.local[:toks],  # type: ignore[union-attr]
+                    block_table=block_table,
+                    cu_seq_lens=chunk.padded_local_cu_seq_lens,
+                    batch_size=chunk.num_requests,
+                    seq_starts=chunk.starts,
+                )
+                g8 = fp8_gather.gather(toks, world)  # type: ignore[union-attr]
+                plan = dcp_context.plan_chunk_segments(
+                    chunk, query_lens_all[chunk.request_slice], heads, q.device
+                )
+                plan.fill_holes(g8)
+                if dcp_context.use_ctxrec_fused(self.kv_b_proj, kv_b_proj_input_dtype):
+                    k, v = dcp_context.ctxrec_fused(
+                        g8, self._k_scale, self.kv_b_proj.weight, kv_bufs, heads
+                    )
+                else:
+                    k, v = dcp_context.produce_kv_fp8(
+                        g8,
+                        lambda x: self.kv_b_proj(
+                            x
+                            if kv_b_proj_input_dtype is None
+                            else x.to(kv_b_proj_input_dtype)
+                        )[0],
+                        self._k_scale,
+                        kv_bufs,
+                        self.kv_lora_rank,
+                        self.qk_nope_head_dim,
+                        heads,
+                    )
+            else:
+                assert toks * world <= workspace.shape[0] - allgather_offset, (
+                    "context chunk larger than the chunked-prefill workspace "
+                    "without the fp8 gather / K-V buffers"
+                )
+                gathered = workspace[allgather_offset : allgather_offset + toks * world]
+                if fp8_gather is not None:
+                    ops.cp_gather_cache(
+                        src_cache=kv_cache,
+                        dst=fp8_gather.local[:toks],
+                        block_table=block_table,
+                        cu_seq_lens=chunk.padded_local_cu_seq_lens,
+                        batch_size=chunk.num_requests,
+                        seq_starts=chunk.starts,
+                    )
+                    dcp_context.dequant_fp8(
+                        fp8_gather.gather(toks, world), gathered, self._k_scale
+                    )
+                elif is_quantized_kv_cache(self.kv_cache_dtype):
+                    ops.gather_and_maybe_dequant_cache(
+                        src_cache=kv_cache,
+                        dst=workspace,
+                        block_table=block_table,
+                        cu_seq_lens=chunk.padded_local_cu_seq_lens,
+                        token_to_seq=chunk.padded_local_token_to_seq,
+                        num_tokens=toks,
+                        kv_cache_dtype=self.kv_cache_dtype,
+                        scale=self._k_scale,
+                        seq_starts=chunk.starts,
+                    )
+                else:
+                    ops.cp_gather_cache(
+                        src_cache=kv_cache,
+                        dst=workspace[:toks],
+                        block_table=block_table,
+                        cu_seq_lens=chunk.padded_local_cu_seq_lens,
+                        batch_size=chunk.num_requests,
+                        seq_starts=chunk.starts,
+                    )
+                if fp8_gather is None:
+                    manager.kv_gather(gathered, workspace[:toks])
+                plan = dcp_context.plan_chunk_segments(
+                    chunk, query_lens_all[chunk.request_slice], heads, q.device
+                )
+                plan.fill_holes(gathered)
+                kv_c_normed = gathered[..., : self.kv_lora_rank]
+                if kv_b_proj_input_dtype is not None:
+                    kv_c_normed = kv_c_normed.to(kv_b_proj_input_dtype)
+                kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
+                    -1, heads, self.qk_nope_head_dim + dv
+                )
+                if fp8_prefill and dcp_context.use_triton_pack():
+                    # Same casts as fused_mla_kv_concat_quant_fp8 (bitwise).
+                    k, v = dcp_context.pack_fp8(
+                        kv_nope,
+                        gathered[..., self.kv_lora_rank :],
+                        self.qk_nope_head_dim,
+                    )
+                else:
+                    k, v = self._fused_mla_kv_concat(
+                        kv_nope, gathered[..., self.kv_lora_rank :], fp8_prefill
+                    )
+
+            q_chunk = q[chunk.token_slice]
+            if plan is prev_plan and chunk.token_slice == prev_slice:
+                pass  # same layout and query rows as the previous chunk: reuse q_rep
+            elif plan.replicate:
+                q_rep = (
+                    q_chunk.view(torch.uint8)
+                    .index_select(0, plan.q_index)
+                    .view(q_chunk.dtype)
+                    if q_chunk.dtype == torch.float8_e4m3fn
+                    else q_chunk.index_select(0, plan.q_index)
+                )
+            else:
+                q_rep = q_chunk.contiguous()
+            prev_plan, prev_slice = plan, chunk.token_slice
+            o_rep, lse_rep = dcp_context.run_segments_fmha(
+                backend, plan, q_rep, k, v, prefill.output_dtype
+            )
+            dcp_context.merge_segments(
+                plan,
+                o_rep,
+                lse_rep,
+                acc_o,
+                acc_lse,
+                output,
+                output_lse,
+                token_base=chunk.token_slice.start,
+            )
+        return output, output_lse
+
     def _gather_context_latent(
         self,
         chunk,
@@ -1046,7 +1312,11 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
             kv_cache = self.kv_cache
             if kv_cache.dtype != torch.float8_e4m3fn:
                 kv_cache = kv_cache.view(torch.float8_e4m3fn)
-            q, k, v = fused_mla_qkv_quant_kv_cache_fp8_insert(
+            q, k, v = (
+                mla_qkv_quant.fused_mla_qkv_quant_kv_cache_fp8_insert
+                if use_qkv_quant_jit(q)
+                else fused_mla_qkv_quant_kv_cache_fp8_insert
+            )(
                 q,
                 k_nope,
                 k_pe,
@@ -1091,7 +1361,11 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         )
 
         if has_context:
-            if self.dcp_world_size > 1:
+            if self.dcp_world_size > 1 and dcp_context.use_segments(prefill):
+                context_output, context_lse = self._dcp_compute_prefill_context(
+                    q, attn_metadata
+                )
+            elif self.dcp_world_size > 1:
                 context_output, context_lse = (
                     self.impl._context_parallel_compute_prefill_context(  # type: ignore[attr-defined]
                         q,

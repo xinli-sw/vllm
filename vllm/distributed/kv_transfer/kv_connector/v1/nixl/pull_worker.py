@@ -74,9 +74,14 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 self._recving_metadata[req_id] = meta
             self._read_blocks_for_req(req_id, meta)
 
+        # Re-post the reads of requests parked after a remote disconnect, once
+        # their peer has been released or re-handshaken.
+        self._dispatch_pull_retries()
         # Start transfers for requests whose handshakes have now finished.
         while not self._ready_requests.empty():
             self._read_blocks_for_req(*self._ready_requests.get_nowait())
+        # One zeroing launch for every pull posted above.
+        self._flush_unwritten_zeroing()
 
         if self.pcp_rank > 0 and not self.pcp_dcp_sharded:
             # Replicated-KV PCP: only PCP rank 0 serves the KV, so this rank
@@ -121,6 +126,9 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         # Send heartbeats to P-side engines to keep KV blocks alive while
         # requests sit in the D scheduler WAITING queue.
         self._send_heartbeats(metadata)
+        # P side: lease renewals that arrived on the side channel.
+        if lease_renewals := getattr(metadata, "lease_renewals", None):
+            self._handle_heartbeat(",".join(lease_renewals))
 
     def _is_turn2_read_expired(self, meta: ReqMeta) -> bool:
         """Whether D's cached blocks for this turn-2 readback have (nearly) expired."""
@@ -137,6 +145,17 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         assert meta.remote is not None and self.transfer_topo is not None
         engine_id = meta.remote.engine_id
         if engine_id in self._invalid_remote_engines:
+            if (
+                self._pull_retry_disconnect
+                and req_id not in self._pull_retry_attempted
+                and req_id in self._recving_metadata
+            ):
+                # Nothing was posted: wait for the peer's release and re-handshake
+                # instead of failing the request (one retry).
+                self._schedule_pull_retry(
+                    req_id, generation=self._engine_generation.get(engine_id, 0)
+                )
+                return
             self._handle_failed_transfer(
                 req_id, None, self._recv_failures, record_failed_transfer=False
             )
@@ -179,6 +198,9 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         local_block_ids = meta.local_physical_block_ids
         remote_region_groups = self.dst_region_group_ids[engine_id]
         local_region_groups = self.region_group_ids or remote_region_groups
+        # Units each group's posted reads write. Region-mapped pulls keep
+        # their own plan (region_blocks_to_zero).
+        written: list[set[int]] | None = None
         if not local_block_ids:
             # Region expansion cannot index empty groups. Pass empty specs to
             # _read_blocks so its existing cache-hit notification path runs.
@@ -253,6 +275,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 for r, blocks in enumerate(local_by_region)
             ]
         else:
+            written = [set() for _ in local_block_ids]
             remote_logical_block_ids = meta.remote.block_ids
             meta.remote.block_ids = self._logical_to_kernel_block_ids(
                 remote_logical_block_ids,
@@ -361,20 +384,32 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 local_xfer_side_handle=local_xfer_side_handle,
                 local_dram_handle=local_dram_handle,
                 remote_xfer_side_handle=remote_xfer_side_handle,
-                expected_consumers=plan.local_consumers,
+                expected_consumers=plan.consumers_for(spec.remote_rank),
                 awaiting_kvs=meta.awaiting_kvs,
+                written=written,
             ):
                 return
+
+        if written is not None:
+            self._queue_unwritten_zeroing(
+                req_id,
+                meta,
+                written,
+                self.transfer_topo.block_size_ratio(remote_info.remote_block_size),
+            )
 
         if self.use_mla and tp_ratio < 0 and len(read_specs) == 1:
             # ..but we still need to notify the other remote ranks that we
             # have the blocks we need so they can update the request state.
             # Same thing for DCP (tp_size == dcp_size), so the raw tp_ratio already
             # reflects whether any remote replica is left unchosen.
-            notif_id = f"{meta.remote.request_id}:{plan.local_consumers}".encode()
             remote_agents = self._remote_agents[meta.remote.engine_id]
             for rank_to_notify, agent in remote_agents.items():
                 if rank_to_notify != (0, read_specs[0].remote_rank):
+                    notif_id = (
+                        f"{meta.remote.request_id}:"
+                        f"{plan.consumers_for(rank_to_notify[1])}"
+                    ).encode()
                     try:
                         self.nixl_wrapper.send_notif(agent, notif_msg=notif_id)
                     except Exception as e:
@@ -401,13 +436,16 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
         remote_xfer_side_handle: int,
         expected_consumers: int,
         awaiting_kvs: bool,
+        written: list[set[int]] | None = None,
     ) -> bool:
         """Post a READ point-to-point xfer request from a single local worker to
         a single remote worker.
 
         Returns True when the read was posted (or was unnecessary), False
         when the request was routed to failure reporting — the caller must
-        not post further transfers for it.
+        not post further transfers for it. ``written`` collects, per group, the
+        local units the read writes: kernel blocks, or remote-sized sub-blocks
+        when the remote block is smaller.
         """
         assert self.transfer_topo is not None
         remote_rank = read_spec.remote_rank
@@ -485,6 +523,10 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                     ),
                 )
 
+        if written is not None and not read_spec.block_ids_by_region:
+            for group_written, group_ids in zip(written, local_block_ids):
+                group_written.update(group_ids)
+
         # NOTE (nicolo) With homogeneous TP, each TP worker loads KV from
         # corresponding rank. With heterogeneous TP, fixing D>P, the D tp
         # workers will issue xfers to parts of the P worker remote kv caches.
@@ -543,20 +585,49 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                     notif_id=notif_id,
                 )
                 return True
-            handle = self.nixl_wrapper.make_prepped_xfer(
-                "READ",
-                local_xfer_side_handle,
+            chunks = self._chunk_read_descs(
                 local_block_descs_ids,
-                remote_xfer_side_handle,
                 remote_block_descs_ids,
-                notif_msg=notif_id,
+                max((len(group) for group in local_block_ids), default=0),
             )
+            # Several transfers (or a possible retry) must not each notify P:
+            # P frees its blocks on the notification. Send it once every read of
+            # the request has finished (get_transfer_results).
+            # A lease check must run before P is told the read finished.
+            defer_notif = (
+                len(chunks) > 1
+                or self._pull_retry_disconnect
+                or self._needs_lease_check(self._recving_metadata.get(request_id))
+            )
+            for local_ids, remote_ids in chunks:
+                if defer_notif:
+                    handle = self.nixl_wrapper.make_prepped_xfer(
+                        "READ",
+                        local_xfer_side_handle,
+                        local_ids,
+                        remote_xfer_side_handle,
+                        remote_ids,
+                    )
+                else:
+                    handle = self.nixl_wrapper.make_prepped_xfer(
+                        "READ",
+                        local_xfer_side_handle,
+                        local_ids,
+                        remote_xfer_side_handle,
+                        remote_ids,
+                        notif_msg=notif_id,
+                    )
 
-            # Begin async xfer.
-            self.nixl_wrapper.transfer(handle)
+                # Begin async xfer.
+                self.nixl_wrapper.transfer(handle)
 
-            # Use handle to check completion in future step().
-            self._recving_transfers[request_id].append(handle)
+                # Use handle to check completion in future step().
+                self._recving_transfers[request_id].append(handle)
+                handle = None
+            if defer_notif:
+                self._pending_recv_notifs.setdefault(request_id, []).append(
+                    (self._remote_agents[dst_engine_id][(0, remote_rank)], notif_id)
+                )
             return True
         except Exception as e:
             self._log_failure(
@@ -568,11 +639,48 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                 remote_rank=remote_rank,
             )
             if not self._handle_failed_transfer(
-                request_id, handle, self._recv_failures
+                request_id, handle, self._recv_failures, error=e
             ):
                 assert handle is not None
                 self._recving_transfers[request_id].append(handle)
             return False
+
+    def _dispatch_pull_retries(self) -> None:
+        """Re-post parked requests whose peer is fresh again; fail those that
+        could not re-post within ``pull_retry_window_s``."""
+        if not self._pull_retry_disconnect or not self._pull_retry_pending:
+            return
+        now = time.perf_counter()
+        for req_id, (scheduled_at, generation) in list(
+            self._pull_retry_pending.items()
+        ):
+            meta = self._recving_metadata.get(req_id)
+            if meta is None or meta.remote is None:
+                # Aborted while parked.
+                del self._pull_retry_pending[req_id]
+                self._pull_retry_attempted.discard(req_id)
+                continue
+            engine_id = meta.remote.engine_id
+            if self._pull_retry_ready(engine_id, generation):
+                del self._pull_retry_pending[req_id]
+                logger.info(
+                    "Re-posting NIXL reads for request %s from remote engine %s.",
+                    req_id,
+                    engine_id,
+                )
+                self._read_blocks_for_req(req_id, meta)
+            elif now - scheduled_at > self._pull_retry_window_s:
+                del self._pull_retry_pending[req_id]
+                logger.warning(
+                    "NIXL pull retry for request %s gave up: remote engine %s was "
+                    "not re-handshaken within %.0fs.",
+                    req_id,
+                    engine_id,
+                    self._pull_retry_window_s,
+                )
+                self._handle_failed_transfer(
+                    req_id, None, self._recv_failures, record_failed_transfer=False
+                )
 
     def _read_blocks_mixed(
         self,

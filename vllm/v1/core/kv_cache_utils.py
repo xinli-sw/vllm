@@ -217,8 +217,21 @@ class KVCacheBlock:
 
 
 class KVCacheBlockCopy(NamedTuple):
+    """Copy one KV cache block's contents into another before the forward.
+
+    ``group_id`` is the KV cache group that owns the block. The worker then
+    copies only that group's views, so other groups' views overlaid on the same
+    page cannot clip or widen the copy. -1 copies the block's page in every
+    view. ``num_tokens`` > 0 bounds the copy to the block's leading positions
+    that hold valid KV, in scheduler units (all DCP ranks together). The rest
+    of the destination keeps its alloc-time zeros, not the source's later KV.
+    0 copies the whole block.
+    """
+
     src_block_id: int
     dst_block_id: int
+    group_id: int = -1
+    num_tokens: int = 0
 
 
 class FreeKVCacheBlockQueue:
@@ -420,6 +433,22 @@ class FreeKVCacheBlockQueue:
         prev_block.next_free_block = first_block
         first_block.prev_free_block = prev_block
 
+        self.num_free_blocks += len(blocks)
+
+    def insert_n_after(self, anchor: KVCacheBlock, blocks: list[KVCacheBlock]) -> None:
+        """Insert blocks, in order, right after ``anchor``: the fake head or a
+        block in the free list."""
+        if not blocks:
+            return
+        after = anchor.next_free_block
+        assert after is not None, "anchor must be the fake head or a free block"
+        prev_block = anchor
+        for block in blocks:
+            block.prev_free_block = prev_block
+            prev_block.next_free_block = block
+            prev_block = block
+        prev_block.next_free_block = after
+        after.prev_free_block = prev_block
         self.num_free_blocks += len(blocks)
 
     def append_n(self, blocks: list[KVCacheBlock]) -> None:

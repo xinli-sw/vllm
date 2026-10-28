@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from collections.abc import Callable
 from dataclasses import replace
 
@@ -9,6 +10,7 @@ from einops import rearrange
 from torch import nn
 from torch.nn.parameter import Parameter
 
+import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import VllmConfig
@@ -50,6 +52,7 @@ from vllm.models.kimi_k3.nvidia.kda_metadata import (
     KimiK3KDAAttentionBackend,
     KimiK3KDAMetadata,
 )
+from vllm.models.kimi_k3.nvidia.ops import kda_conv, kda_norm, kda_segscan
 from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
 from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
@@ -66,6 +69,13 @@ from vllm.v1.kv_cache_interface import MambaSpec
 from vllm.v1.worker.workspace import current_workspace_manager
 
 logger = init_logger(__name__)
+
+# VLLM_K3_KDA_CONV_TILE=0: the generic causal_conv1d_fn for the prefill short
+# convolutions (ops/kda_conv.py is bitwise equal to it).
+_CONV_TILE = os.environ.get("VLLM_K3_KDA_CONV_TILE", "1") == "1"
+# VLLM_K3_KDA_NORM_TILES=0: FLA's rms_norm_gated for the output gate norm
+# (ops/kda_norm.py is bitwise equal to it).
+_NORM_TILES = os.environ.get("VLLM_K3_KDA_NORM_TILES", "1") == "1"
 
 _KDA_GATE_LOGBOUND_MIN = -5.0
 
@@ -764,6 +774,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             None
         )
         self._checkpoint_exporter: FlashKDAPrefillCheckpointExporter | None = None
+        self._segscan_bufs: kda_segscan.SegBuffers | None = None
         if self.kda_prefill_backend == "flashkda":
             T = vllm_config.scheduler_config.max_num_batched_tokens
             N = vllm_config.scheduler_config.max_num_seqs
@@ -777,7 +788,13 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                 ((N, H, D, D), self.get_state_dtype()[1]),
                 ((workspace_size,), torch.uint8),
             )
-            self._checkpoint_exporter = FlashKDAPrefillCheckpointExporter()
+            self._checkpoint_exporter = self._make_checkpoint_exporter()
+            if kda_segscan.enabled() and D == 128:
+                # Segment-parallel prefill buffers, shared by every KDA layer
+                # and allocated before the memory profile.
+                self._segscan_bufs = kda_segscan.init_buffers(
+                    T, H, torch.device("cuda", torch.accelerator.current_device_index())
+                )
         elif self.kda_prefill_backend == "flashinfer":
             T = vllm_config.scheduler_config.max_num_batched_tokens
             H, D = self.local_num_heads, self.head_dim
@@ -827,14 +844,29 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
 
+    def _make_checkpoint_exporter(self) -> FlashKDAPrefillCheckpointExporter:
+        # The prefill short conv keeps (and on resume reads) conv_size - 1 columns:
+        # the last inputs before the checkpoint. Speculative decoding widens the
+        # cached conv state past them; those columns are not a history window, so
+        # the exported window must not follow the cache's full width.
+        return FlashKDAPrefillCheckpointExporter(state_len=self.conv_size - 1)
+
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> MambaSpec:
         spec = super().get_kv_cache_spec(vllm_config)
         assert isinstance(spec, MambaSpec)
         alignment = kda_prefill_checkpoint_alignment(self.kda_prefill_backend)
+        cache_config = vllm_config.cache_config
         return replace(
             spec,
             num_prefill_checkpoint_blocks=int(alignment is not None),
             prefill_checkpoint_alignment=alignment,
+            # The first-chunk mask comes from the V2 runner's model state.
+            prefill_snapshot=(
+                alignment is not None
+                and cache_config.mamba_internal_snapshot
+                and cache_config.mamba_cache_mode == "align"
+                and vllm_config.use_v2_model_runner
+            ),
         )
 
     def forward(
@@ -898,7 +930,12 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         )
         core_attn_out = rearrange(core_attn_out, "1 n h d -> n (h d)")
         if self.gemm_rs_ar is not None and self.gemm_rs_ar.should_run(core_attn_out):
-            return self.gemm_rs_ar.apply(core_attn_out, self.o_proj)
+            # VLLM_KIMI_K3_GEMM_AR_ALIAS: hand back the workspace view; the
+            # decoder layer consumes it before the next GEMM-AR, and copies it
+            # only where it keeps it (AttnRes block-write layers).
+            return self.gemm_rs_ar.apply(
+                core_attn_out, self.o_proj, copy_out=not envs.VLLM_KIMI_K3_GEMM_AR_ALIAS
+            )
         return self.o_proj(core_attn_out)[0]
 
     @eager_break_during_capture
@@ -1169,6 +1206,19 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                     state: torch.Tensor,
                     weight: torch.Tensor,
                 ) -> torch.Tensor:
+                    xt = x.transpose(0, 1)
+                    if _CONV_TILE and kda_conv.supported(xt, weight, state, m):
+                        assert non_spec_state_indices_tensor is not None
+                        assert has_initial_state is not None
+                        return kda_conv.kda_prefill_conv(
+                            xt,
+                            weight,
+                            state,
+                            non_spec_query_start_loc,
+                            non_spec_state_indices_tensor,
+                            has_initial_state,
+                            m,
+                        ).transpose(0, 1)
                     return causal_conv1d_fn(
                         x.transpose(0, 1),
                         weight,
@@ -1209,7 +1259,57 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                     )[:, : q_ns.shape[1]]
                     if non_spec_out is not None:
                         flashkda_out = non_spec_out
-                    if checkpoint is not None:
+                    seg_plan = (
+                        kda_segscan.make_plan(
+                            m.non_spec_query_start_loc_cpu,
+                            self.local_num_heads,
+                            q_ns.device,
+                            checkpoint.offsets if checkpoint is not None else None,
+                        )
+                        if self._segscan_bufs is not None
+                        and m.non_spec_query_start_loc_cpu is not None
+                        and flashkda_out.is_contiguous()
+                        else None
+                    )
+                    if (
+                        seg_plan is not None
+                        and seg_plan.num_seqs == initial_state.shape[0]
+                    ):
+                        num_sequences = initial_state.shape[0]
+                        final_state = final_state[:num_sequences]
+                        checkpoint_state = checkpoint_state[:num_sequences]
+                        kda_segscan.segmented_prefill(
+                            plan=seg_plan,
+                            bufs=self._segscan_bufs,  # type: ignore[arg-type]
+                            q=q_ns,
+                            k=k_ns,
+                            v=v_ns,
+                            g=g1_ns,
+                            beta=beta_ns,
+                            A_log=self.A_log,
+                            dt_bias=self.dt_bias,
+                            lower_bound=self.gate_lower_bound,
+                            initial_state=initial_state,
+                            out=flashkda_out,
+                            final_state=final_state,
+                            workspace=workspace,
+                            checkpoint_state=(
+                                checkpoint_state if checkpoint is not None else None
+                            ),
+                        )
+                        core_attn_out_non_spec = flashkda_out
+                        last_recurrent_state = final_state
+                        if checkpoint is not None:
+                            assert self._checkpoint_exporter is not None
+                            self._checkpoint_exporter.export(
+                                checkpoint,
+                                raw_qkv=mixed_qkv_ns,
+                                conv_state=conv_state,
+                                recurrent_checkpoint=checkpoint_state,
+                                recurrent_state=recurrent_state,
+                                cu_seqlens=non_spec_query_start_loc,
+                            )
+                    elif checkpoint is not None:
                         assert non_spec_query_start_loc is not None
                         num_sequences = initial_state.shape[0]
                         assert checkpoint.checkpoint_offsets.shape == (num_sequences,)
@@ -1370,4 +1470,9 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             assert core_attn_out_spec is not None
         # Triton normalizes in place, so this is a self-copy with no device
         # work. Keep it for the out-of-place native implementation.
-        core_attn_out.copy_(self.o_norm(core_attn_out, g2))
+        if _NORM_TILES and kda_norm.supported(core_attn_out, g2, self.o_norm):
+            kda_norm.rmsnorm_gated_(
+                core_attn_out, g2, self.o_norm.weight, self.o_norm.eps
+            )
+        else:
+            core_attn_out.copy_(self.o_norm(core_attn_out, g2))
