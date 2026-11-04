@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import itertools
 import weakref
 from collections.abc import Callable, Iterable, Sequence
 from typing import Any
@@ -102,6 +103,41 @@ class BlockHashToBlockMap:
     def clear(self) -> None:
         self._cache.clear()
         self._dup_ids.clear()
+
+
+def select_contiguous_blocks(
+    candidates: list[KVCacheBlock], num_blocks: int
+) -> list[KVCacheBlock]:
+    """Choose ``num_blocks`` of ``candidates`` (eviction order) favoring runs
+    of consecutive block ids.
+
+    Runs of consecutive ids are ranked by their oldest member and taken whole,
+    oldest first; the last run is cut to a consecutive slice that contains its
+    oldest member. Returns the chosen blocks sorted by block id.
+    """
+    assert 0 < num_blocks <= len(candidates)
+    pos = {b.block_id: i for i, b in enumerate(candidates)}
+    by_id = sorted(candidates, key=lambda b: b.block_id)
+    runs: list[list[KVCacheBlock]] = []
+    for b in by_id:
+        if runs and b.block_id == runs[-1][-1].block_id + 1:
+            runs[-1].append(b)
+        else:
+            runs.append([b])
+    runs.sort(key=lambda r: min(pos[b.block_id] for b in r))
+    chosen: list[KVCacheBlock] = []
+    for run in runs:
+        need = num_blocks - len(chosen)
+        if need <= 0:
+            break
+        if len(run) <= need:
+            chosen.extend(run)
+            continue
+        oldest = min(range(len(run)), key=lambda i: pos[run[i].block_id])
+        start = max(0, min(oldest, len(run) - need))
+        chosen.extend(run[start : start + need])
+    chosen.sort(key=lambda b: b.block_id)
+    return chosen
 
 
 class BlockPool:
@@ -694,7 +730,39 @@ class BlockPool:
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
         ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
+        return self._claim_new_blocks(ret)
 
+    def get_new_blocks_contiguous(
+        self, num_blocks: int, window: int
+    ) -> list[KVCacheBlock]:
+        """Like get_new_blocks(), but prefer runs of consecutive block ids.
+
+        Only the ``num_blocks + window`` blocks at the eviction end of the free
+        queue are candidates, so eviction order deviates from LRU by at most
+        ``window`` blocks, and the least recently used free block is always
+        taken. Candidates are grouped into runs of consecutive block ids;
+        runs are taken whole, oldest run first, until ``num_blocks`` are
+        chosen. Used by offload tiers where a block id is a file offset and
+        consecutive ids coalesce into one large IO.
+
+        Returns the blocks sorted by block id.
+        """
+        if window <= 0 or num_blocks <= 1:
+            return self.get_new_blocks(num_blocks)
+        if num_blocks > self.get_num_free_blocks():
+            raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
+        candidates = list(
+            itertools.islice(
+                self.free_block_queue.iter_blocks_after(None), num_blocks + window
+            )
+        )
+        chosen = select_contiguous_blocks(candidates, num_blocks)
+        for block in chosen:
+            self.free_block_queue.remove(block)
+        return self._claim_new_blocks(chosen)
+
+    def _claim_new_blocks(self, ret: list[KVCacheBlock]) -> list[KVCacheBlock]:
+        """Bookkeeping for blocks just taken off the free queue."""
         if self._reuse_watchers:
             self._notify_reuse(ret)
 

@@ -26,6 +26,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.simple_kv_offload.disk_backend import (
+    DEFAULT_DISK_ALLOC_WINDOW_BLOCKS,
     DEFAULT_DISK_BUFFER_SLOTS,
     DEFAULT_DISK_IO_THREADS,
     DEFAULT_DISK_MAX_COALESCE_BLOCKS,
@@ -69,6 +70,7 @@ _DISK_ONLY_KEYS = (
     "disk_io_threads",
     "disk_max_coalesce_blocks",
     "disk_store_io_threads",
+    "disk_alloc_window_blocks",
 )
 
 
@@ -176,6 +178,17 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         )
         # Cap on IO threads running stores at once (default: half), so loads
         # always find a free thread.
+        # Disk slots are allocated preferring consecutive ids within this many
+        # blocks past the LRU end, so a request's blocks coalesce into large
+        # reads later. Bounds how far eviction may deviate from LRU; 0 = off.
+        disk_alloc_window_blocks = max(
+            0,
+            int(
+                extra_config.get(
+                    "disk_alloc_window_blocks", DEFAULT_DISK_ALLOC_WINDOW_BLOCKS
+                )
+            ),
+        )
         disk_store_io_threads = extra_config.get("disk_store_io_threads")
         if disk_store_io_threads is not None:
             disk_store_io_threads = max(1, int(disk_store_io_threads))
@@ -248,6 +261,7 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 use_page_cache=use_page_cache if disk_mode else False,
                 num_cpu_blocks=num_cpu_blocks,
                 aligned_num_cpu_blocks=aligned_num_cpu_blocks,
+                contiguous_alloc_window=disk_alloc_window_blocks if disk_mode else 0,
             )
         elif role == KVConnectorRole.WORKER:
             self.worker_handler = SimpleCPUOffloadWorker(

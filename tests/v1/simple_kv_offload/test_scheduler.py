@@ -476,6 +476,7 @@ def make_scheduler(
     lazy: bool = False,
     kv_cache_config: KVCacheConfig | None = None,
     vllm_config: VllmConfig | None = None,
+    contiguous_alloc_window: int = 0,
 ) -> SchedulerFixture:
     """Build a SimpleCPUOffloadScheduler with small block pools."""
     if kv_cache_config is None:
@@ -492,6 +493,7 @@ def make_scheduler(
         scheduler_block_size=BLOCK_SIZE,
         hash_block_size=BLOCK_SIZE,
         lazy_offload=lazy,
+        contiguous_alloc_window=contiguous_alloc_window,
     )
 
     # Build a real GPU block pool and bind it
@@ -3880,3 +3882,41 @@ def test_loads_in_one_step_get_per_request_events() -> None:
     assert sched._load_event_to_reqs[e0] == ["loader-0"]
     simulate_load_completion(sched, {"loader-0"})
     assert not sched._load_event_to_reqs
+
+
+def _scramble_free_queue(pool: BlockPool) -> None:
+    """Interleave the free queue so LRU order has no consecutive ids."""
+    blocks = pool.get_new_blocks(pool.get_num_free_blocks())
+    ids = sorted(b.block_id for b in blocks)
+    by_id = {b.block_id: b for b in blocks}
+    order = ids[0::4] + ids[1::4] + ids[2::4] + ids[3::4]
+    pool.free_blocks([by_id[i] for i in order])
+
+
+@pytest.mark.parametrize("window", [0, 64])
+def test_contiguous_offload_allocation(window: int) -> None:
+    """With a window, a request's offload blocks get consecutive ids even
+    when the LRU free order is fragmented."""
+    fix = make_scheduler(
+        num_cpu_blocks=32, num_gpu_blocks=32, contiguous_alloc_window=window
+    )
+    sched = fix.scheduler
+    _scramble_free_queue(sched.cpu_block_pool)
+    oldest = next(sched.cpu_block_pool.free_block_queue.iter_blocks_after(None))
+
+    num_blocks = 4
+    req = make_request(num_blocks=num_blocks)
+    kv = _alloc_and_register(fix, req, num_blocks)
+    sched.update_state_after_alloc(req, kv, num_external_tokens=0)
+    meta = sched.build_connector_meta(
+        make_scheduler_output(
+            {req.request_id: num_blocks * BLOCK_SIZE},
+            new_reqs={req.request_id: kv.get_block_ids()},
+        )
+    )
+    ids = meta.store_cpu_blocks
+    assert len(ids) == num_blocks
+    # The least recently used free block is always the first one taken.
+    assert oldest.block_id in ids
+    consecutive = sorted(ids) == list(range(min(ids), min(ids) + num_blocks))
+    assert consecutive == (window > 0)

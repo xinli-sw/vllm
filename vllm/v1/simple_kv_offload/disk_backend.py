@@ -61,6 +61,8 @@ _ALIGNMENT = 4096
 DEFAULT_DISK_IO_THREADS = 16
 DEFAULT_DISK_BUFFER_SLOTS = 32
 DEFAULT_DISK_MAX_COALESCE_BLOCKS = 4
+# Scheduler side: LRU window searched for consecutive free disk slots.
+DEFAULT_DISK_ALLOC_WINDOW_BLOCKS = 256
 
 
 def _iov_max() -> int:

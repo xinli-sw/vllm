@@ -155,8 +155,13 @@ class SimpleCPUOffloadScheduler:
         use_page_cache: bool = False,
         num_cpu_blocks: int | None = None,
         aligned_num_cpu_blocks: int | None = None,
+        contiguous_alloc_window: int = 0,
     ):
         self.vllm_config = vllm_config
+        # >0: allocate offload blocks preferring consecutive ids within this
+        # many blocks past the LRU end (disk tier: consecutive ids coalesce
+        # into one large IO). 0: strict LRU allocation.
+        self.contiguous_alloc_window = max(0, int(contiguous_alloc_window))
         self.kv_cache_config = kv_cache_config
         # When disk mode is active, the offload pool size is disk-based.
         offload_capacity = (
@@ -364,6 +369,14 @@ class SimpleCPUOffloadScheduler:
             else:
                 target += cdiv(max_num_batched_tokens, block_size)
         return int(target * (1 + WATERMARK_RATIO))
+
+    def _alloc_offload_blocks(self, num_blocks: int) -> list["KVCacheBlock"]:
+        """Allocate offload blocks, favoring consecutive ids when enabled."""
+        if self.contiguous_alloc_window > 0:
+            return self.cpu_block_pool.get_new_blocks_contiguous(
+                num_blocks, self.contiguous_alloc_window
+            )
+        return self.cpu_block_pool.get_new_blocks(num_blocks)
 
     def bind_gpu_block_pool(self, gpu_block_pool: BlockPool) -> None:
         """Bind GPU block pool so that we can touch blocks during stores.
@@ -693,7 +706,7 @@ class SimpleCPUOffloadScheduler:
 
         # Batch-allocate CPU blocks.
         if gpu_ids:
-            cpu_blocks = cpu_pool.get_new_blocks(len(gpu_ids))
+            cpu_blocks = self._alloc_offload_blocks(len(gpu_ids))
             cpu_ids = [blk.block_id for blk in cpu_blocks]
             # Touch GPU blocks to prevent eviction during async copy.
             gpu_pool.touch([gpu_pool.blocks[bid] for bid in gpu_ids])
@@ -839,7 +852,7 @@ class SimpleCPUOffloadScheduler:
             # Batch allocate the CPU destinations.
             n_to_alloc = len(gpu_block_ids)
             if n_to_alloc > 0:
-                cpu_blocks_alloc = cpu_block_pool.get_new_blocks(n_to_alloc)
+                cpu_blocks_alloc = self._alloc_offload_blocks(n_to_alloc)
                 cpu_block_ids = [blk.block_id for blk in cpu_blocks_alloc]
             else:
                 cpu_block_ids = []
@@ -1339,7 +1352,7 @@ class SimpleCPUOffloadScheduler:
                 block_meta.append({})
         if not gpu_ids:
             return
-        cpu_blocks = self.cpu_block_pool.get_new_blocks(len(gpu_ids))
+        cpu_blocks = self._alloc_offload_blocks(len(gpu_ids))
         self._pending_finished_stores.append(
             TransferMeta(gpu_ids, [b.block_id for b in cpu_blocks], block_meta)
         )
