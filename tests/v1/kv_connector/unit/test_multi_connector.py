@@ -1428,3 +1428,20 @@ def test_multi_connector_mixed_hma_disables_hybrid_kv_cache(monkeypatch):
             assert mc._all_support_hma is False
         finally:
             llm.llm_engine.engine_core.shutdown()
+
+
+@pytest.mark.parametrize(
+    "results,expected",
+    [
+        # Earlier connector serves: a later one that is not ready is ignored.
+        ([(16, True), (None, False)], (16, True)),
+        # Nothing served yet: a not-ready connector defers the request.
+        ([(0, False), (None, False)], (None, False)),
+        ([(None, False), (16, True)], (None, False)),
+    ],
+)
+def test_not_ready_child_only_defers_unserved_requests(mc, results, expected):
+    request = MagicMock(request_id="request")
+    for connector, result in zip(mc._connectors, results):
+        connector.get_num_new_matched_tokens.return_value = result
+    assert mc.get_num_new_matched_tokens(request, 0) == expected

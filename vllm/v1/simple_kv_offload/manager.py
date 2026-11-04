@@ -45,6 +45,12 @@ from vllm.v1.kv_cache_interface import (
     get_kv_cache_spec_sliding_window,
 )
 from vllm.v1.outputs import KVConnectorOutput
+from vllm.v1.simple_kv_offload.admission import (
+    DEFAULT_DISK_LOAD_ADMISSION_MS,
+    DEFAULT_DISK_MIN_INFLIGHT_LOAD_BYTES,
+    Admission,
+    DiskLoadAdmission,
+)
 from vllm.v1.simple_kv_offload.metadata import (
     SimpleCPUOffloadMetadata,
     SimpleCPUOffloadWorkerMetadata,
@@ -156,6 +162,11 @@ class SimpleCPUOffloadScheduler:
         num_cpu_blocks: int | None = None,
         aligned_num_cpu_blocks: int | None = None,
         contiguous_alloc_window: int = 0,
+        disk_max_inflight_load_bytes: int = 0,
+        disk_load_admission_ms: float = DEFAULT_DISK_LOAD_ADMISSION_MS,
+        disk_min_inflight_load_bytes: int = DEFAULT_DISK_MIN_INFLIGHT_LOAD_BYTES,
+        disk_load_defer_timeout_ms: float = 0.0,
+        disk_recompute_tokens_per_s: float = 0.0,
     ):
         self.vllm_config = vllm_config
         # >0: allocate offload blocks preferring consecutive ids within this
@@ -239,6 +250,34 @@ class SimpleCPUOffloadScheduler:
         self.cpu_block_pool: BlockPool = self.cpu_coordinator.block_pool
         # GPU block pool reference - bound after scheduler builds kv_cache_manager
         self._gpu_block_pool: BlockPool | None = None
+
+        # Disk tier only: bound loads accepted but not yet completed so that
+        # a slow disk defers new hits instead of parking GPU blocks on them.
+        self._load_admission: DiskLoadAdmission | None = None
+        if disk_capacity_bytes > 0 and disk_max_inflight_load_bytes >= 0:
+            self._load_admission = DiskLoadAdmission(
+                bytes_per_block=gpu_total_bytes(kv_cache_config)
+                // max(1, kv_cache_config.num_blocks),
+                tokens_per_block=self.block_size,
+                max_inflight_bytes=disk_max_inflight_load_bytes,
+                admission_ms=disk_load_admission_ms,
+                min_inflight_bytes=disk_min_inflight_load_bytes,
+                defer_timeout_ms=disk_load_defer_timeout_ms,
+                recompute_tokens_per_s=disk_recompute_tokens_per_s,
+            )
+            logger.info(
+                "SimpleCPUOffloadScheduler: disk load admission %s "
+                "(%.2f MB/block, floor %d blocks, horizon %.0f ms, "
+                "defer timeout %.0f ms, recompute %.0f tok/s)",
+                f"fixed cap {self._load_admission.fixed_cap_blocks} blocks"
+                if self._load_admission.fixed_cap_blocks is not None
+                else "adaptive",
+                self._load_admission.bytes_per_block / 1e6,
+                self._load_admission.min_cap_blocks,
+                disk_load_admission_ms,
+                disk_load_defer_timeout_ms,
+                disk_recompute_tokens_per_s,
+            )
 
         # Load metadata
         self._reqs_to_load: dict[str, LoadRequestState] = {}
@@ -444,6 +483,16 @@ class SimpleCPUOffloadScheduler:
             pin_blocks = [
                 blk for grp in cpu_hit_blocks for blk in grp if not blk.is_null
             ]
+            if self._load_admission is not None:
+                decision = self._load_admission.check(
+                    request.request_id, len(pin_blocks), hit_length
+                )
+                if decision is Admission.DEFER:
+                    # Not ready: the scheduler asks again on a later step and
+                    # allocates nothing for this request meanwhile.
+                    return None, False
+                if decision is Admission.RECOMPUTE:
+                    return 0, False
             self.cpu_block_pool.touch(pin_blocks)
             self._pending_cpu_hits[request.request_id] = (
                 cpu_hit_blocks,
@@ -577,6 +626,8 @@ class SimpleCPUOffloadScheduler:
         self._reqs_to_load[req_id] = LoadRequestState(
             request=request, transfer_meta=TransferMeta(gpu_block_ids, cpu_block_ids)
         )
+        if self._load_admission is not None:
+            self._load_admission.on_admitted(req_id, len(cpu_block_ids))
 
     def build_connector_meta(
         self,
@@ -607,6 +658,10 @@ class SimpleCPUOffloadScheduler:
                     store_state = self._reqs_to_store.get(req_id)
                     if store_state is not None:
                         store_state.store_events.add(store_event)
+
+        if self._load_admission is not None:
+            # build_connector_meta() closes the scheduling step.
+            self._load_admission.end_step()
 
         # --- Loads ---
         # One event per request so each request is reported as soon as its own
@@ -1298,6 +1353,8 @@ class SimpleCPUOffloadScheduler:
         if pending is not None:
             self._free_pending_cpu_hit(pending)
         self._pending_local_hits.pop(req_id, None)
+        if self._load_admission is not None:
+            self._load_admission.on_request_gone(req_id)
 
         # Handle load: defer cleanup if load is in-flight
         load_state = self._reqs_to_load.get(req_id)
@@ -1455,6 +1512,12 @@ class SimpleCPUOffloadScheduler:
                 if not reqs:
                     self._load_event_to_reqs.pop(state.load_event, None)
 
+        if self._load_admission is not None and state.transfer_meta is not None:
+            self._load_admission.on_released(
+                len(state.transfer_meta.cpu_block_ids),
+                completed=state.load_event is not None,
+            )
+
         if state.transfer_meta is not None:
             # Free CPU touch refs
             self.cpu_block_pool.free_blocks(
@@ -1509,6 +1572,8 @@ class SimpleCPUOffloadScheduler:
             self._free_pending_cpu_hit(pending)
         self._pending_cpu_hits.clear()
         self._pending_local_hits.clear()
+        if self._load_admission is not None:
+            self._load_admission.reset_deferrals()
 
         self._abandoned_store_event_to_blocks.update(self._store_event_to_blocks)
         for transfer in self._pending_finished_stores:

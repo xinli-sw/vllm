@@ -476,9 +476,14 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
             toks, load_async = c.get_num_new_matched_tokens(
                 request, num_computed_tokens
             )
-            # If there is a connector still looking up the matches,
-            # we return None to indicate that we are not done yet.
             if toks is None:
+                if to_return[0] > 0:
+                    # An earlier connector already serves this request; a
+                    # later one that is not ready (still looking up, or
+                    # deferring under load) would not be used anyway.
+                    continue
+                # A connector that could serve the request is not ready yet:
+                # return None so the scheduler asks again later.
                 return (None, False)
             # The first connector that has new matched tokens will be assigned
             # to this request.
