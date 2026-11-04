@@ -4,9 +4,15 @@
 
 Data path (high queue depth):
 
+- Staging is *block-major*, matching the file: slot ``s`` holds a whole block
+  contiguously (layer ``i`` at ``s * stride + offset[i]``), so a block is one
+  contiguous buffer and the per-layer scatter/gather happens in the batched
+  GPU DMA. ``stride`` is the block size rounded up to 4 KiB (O_DIRECT).
 - Each ``launch_copy`` call is one *batch*. A per-direction coordinator thread
   splits a batch into *runs* of blocks whose disk slots are contiguous (up to
-  ``max_coalesce_blocks``), so a run is a single ``preadv``/``pwritev``.
+  ``max_coalesce_blocks`` and ``max_io_bytes``). A run gets contiguous staging
+  slots, so it is a single one-buffer ``preadv``/``pwritev`` of up to
+  ``max_io_bytes``.
 - Runs are executed by a shared pool of IO threads (``preadv``/``pwritev``
   release the GIL), so many reads/writes are in flight at once.
 - Each direction owns a ring of pinned, O_DIRECT-aligned staging slots. A load
@@ -48,7 +54,7 @@ from vllm.v1.simple_kv_offload.cuda_mem_ops import (
     CU_MEMCPY_SRC_ACCESS_ORDER_ANY,
     CU_MEMCPY_SRC_ACCESS_ORDER_STREAM,
     BatchMemcpyParams,
-    build_params,
+    build_strided_params,
     copy_blocks,
     pin_tensor,
     unpin_tensor,
@@ -63,8 +69,10 @@ _ALIGNMENT = 4096
 # Measured on GB300 (4x NVMe RAID0): loads reach the fio ceiling with fewer
 # than 4 IO threads per rank, so keep pinned staging modest.
 DEFAULT_DISK_IO_THREADS = 8
-DEFAULT_DISK_BUFFER_SLOTS = 16
-DEFAULT_DISK_MAX_COALESCE_BLOCKS = 4
+# Staging per direction is sized in bytes unless disk_buffer_slots is given.
+DEFAULT_DISK_STAGING_BYTES = 128 << 20
+DEFAULT_DISK_MAX_COALESCE_BLOCKS = 32
+DEFAULT_DISK_MAX_IO_BYTES = 16 << 20
 # Scheduler side: LRU window searched for consecutive free disk slots.
 DEFAULT_DISK_ALLOC_WINDOW_BLOCKS = 256
 
@@ -94,35 +102,29 @@ def _round_up(x: int, align: int) -> int:
 
 
 class StagingRegion:
-    """Pinned host staging for one direction: one page-aligned region.
+    """Pinned host staging: one page-aligned, page-padded anonymous mmap.
 
-    All tensors' ``[num_slots, bpb]`` buffers live in a single anonymous mmap,
-    aligned to and padded to whole host pages, and registered with
-    cudaHostRegister exactly once. cudaHostRegister works on whole pages, so
-    buffers carved from the malloc heap can share a page with another
-    registration (or with a still-registered buffer from an earlier init) and
-    fail with cudaErrorHostMemoryAlreadyRegistered on 64 KiB-page kernels.
+    Registered with cudaHostRegister exactly once. cudaHostRegister works on
+    whole pages, so buffers carved from the malloc heap can share a page with
+    another registration (or with a still-registered buffer from an earlier
+    init) and fail with cudaErrorHostMemoryAlreadyRegistered on 64 KiB-page
+    kernels.
     """
 
-    def __init__(self, num_slots: int, bpbs: list[int]) -> None:
+    def __init__(self, nbytes: int) -> None:
         page = _page_size()
-        offsets = []
-        off = 0
-        for bpb in bpbs:
-            offsets.append(off)
-            off = _round_up(off + num_slots * bpb, _ALIGNMENT)
-        self.nbytes = _round_up(max(off, 1), page)
+        self.nbytes = _round_up(max(nbytes, 1), page)
         # Over-allocate one page so the region can start on a page boundary
         # even if the configured page size exceeds mmap's own alignment.
         self._mmap = mmap.mmap(-1, self.nbytes + page)
         full = torch.frombuffer(self._mmap, dtype=torch.int8)
         shift = -full.data_ptr() % page
         self.base = full[shift : shift + self.nbytes]
-        self.tensors = [
-            self.base[o : o + num_slots * bpb].view(num_slots, bpb)
-            for o, bpb in zip(offsets, bpbs)
-        ]
+        self.view = memoryview(self.base.numpy())
         self.registered = False
+
+    def data_ptr(self) -> int:
+        return self.base.data_ptr()
 
     def register(self) -> None:
         pin_tensor(self.base)
@@ -201,25 +203,37 @@ class _BackendShutdown(Exception):
 
 
 class _SlotPool:
-    """Pinned staging slots, optionally released only after a DMA event."""
+    """Staging slots handed out as contiguous ranges (one IO buffer per run),
+    optionally released only after a DMA event."""
 
     def __init__(self, num_slots: int) -> None:
         self.num_slots = num_slots
-        self._free: deque[int] = deque(range(num_slots))
+        self._is_free = [True] * num_slots
         self._pending: deque[tuple[torch.Event, list[int]]] = deque()
         self._cond = threading.Condition()
         self._closed = False
 
     def _reclaim_locked(self) -> None:
         while self._pending and self._pending[0][0].query():
-            self._free.extend(self._pending.popleft()[1])
+            for s in self._pending.popleft()[1]:
+                self._is_free[s] = True
+
+    def _take_locked(self, k: int) -> list[int] | None:
+        """First-fit range of ``k`` contiguous free slots."""
+        run = 0
+        for i, free in enumerate(self._is_free):
+            run = run + 1 if free else 0
+            if run == k:
+                start = i - k + 1
+                for j in range(start, i + 1):
+                    self._is_free[j] = False
+                return list(range(start, i + 1))
+        return None
 
     def try_acquire(self, k: int) -> list[int] | None:
         with self._cond:
             self._reclaim_locked()
-            if len(self._free) >= k:
-                return [self._free.popleft() for _ in range(k)]
-            return None
+            return self._take_locked(k)
 
     def acquire(self, k: int) -> list[int]:
         assert 0 < k <= self.num_slots
@@ -227,8 +241,9 @@ class _SlotPool:
             to_sync: tuple[torch.Event, list[int]] | None = None
             with self._cond:
                 self._reclaim_locked()
-                if len(self._free) >= k:
-                    return [self._free.popleft() for _ in range(k)]
+                slots = self._take_locked(k)
+                if slots is not None:
+                    return slots
                 if self._pending:
                     to_sync = self._pending.popleft()
                 elif self._closed:
@@ -242,7 +257,8 @@ class _SlotPool:
 
     def release(self, slots: list[int]) -> None:
         with self._cond:
-            self._free.extend(slots)
+            for s in slots:
+                self._is_free[s] = True
             self._cond.notify_all()
 
     def release_after(self, event: torch.Event, slots: list[int]) -> None:
@@ -361,10 +377,7 @@ class DiskBackend:
         self._total_block_bytes: int = 0
         self._store_region: StagingRegion | None = None
         self._load_region: StagingRegion | None = None
-        self._store_buffer_caches: dict[str, torch.Tensor] = {}
-        self._load_buffer_caches: dict[str, torch.Tensor] = {}
-        self._store_slot_views: list[list[memoryview]] = []
-        self._load_slot_views: list[list[memoryview]] = []
+        self._stride: int = 0  # bytes per block on disk and in staging
         self._per_tensor_bpb: list[int] = []
         self._tensor_names: list[str] = []
         self._max_run_blocks: int = 1
@@ -385,85 +398,73 @@ class DiskBackend:
         disk_path: str,
         num_disk_slots: int,
         total_block_bytes: int,
-        num_buffer_slots: int = DEFAULT_DISK_BUFFER_SLOTS,
+        num_buffer_slots: int | None = None,
         use_page_cache: bool = False,
         num_io_threads: int = DEFAULT_DISK_IO_THREADS,
         max_coalesce_blocks: int = DEFAULT_DISK_MAX_COALESCE_BLOCKS,
         max_store_io_threads: int | None = None,
         ordered_load_completion: bool = False,
+        max_io_bytes: int = DEFAULT_DISK_MAX_IO_BYTES,
+        staging_bytes: int = DEFAULT_DISK_STAGING_BYTES,
     ) -> None:
         self._ordered_load_completion = ordered_load_completion
         self._load_stream = load_stream
         self._store_stream = store_stream
         self._total_block_bytes = total_block_bytes
-        num_buffer_slots = max(1, int(num_buffer_slots))
-        num_io_threads = max(1, int(num_io_threads))
-        self._num_buffer_slots = num_buffer_slots
         self._tensor_names = list(gpu_caches.keys())
         self._per_tensor_bpb = [
             t.stride(0) * t.element_size() for t in gpu_caches.values()
         ]
+        assert sum(self._per_tensor_bpb) == total_block_bytes
+        # Pad each block to 4 KiB so every slot (in the file and in staging)
+        # starts O_DIRECT aligned, whatever the per-layer sizes are.
+        stride = _round_up(total_block_bytes, _ALIGNMENT)
+        self._stride = stride
+        num_io_threads = max(1, int(num_io_threads))
 
-        # The stride alignment is an O_DIRECT kernel-DMA requirement; buffered
-        # I/O through the page cache has no alignment constraint.
-        if not use_page_cache:
-            assert total_block_bytes % _ALIGNMENT == 0, (
-                f"total_block_bytes={total_block_bytes} not aligned to {_ALIGNMENT}"
-            )
+        run_blocks = max(1, min(int(max_coalesce_blocks), int(max_io_bytes) // stride))
+        if num_buffer_slots is None:
+            # Room for several full-size runs in flight per direction.
+            num_buffer_slots = max(2 * run_blocks, int(staging_bytes) // stride)
+        num_buffer_slots = max(1, int(num_buffer_slots))
+        self._num_buffer_slots = num_buffer_slots
+        # Keep at least two runs' worth of slots so IO and DMA overlap.
+        self._max_run_blocks = max(1, min(run_blocks, num_buffer_slots // 2))
 
-        # A run must fit in one syscall (IOV_MAX iovecs) and in the staging
-        # ring; keep at least two runs' worth of slots so IO and DMA overlap.
-        iov_cap = max(1, _IOV_MAX // max(1, len(self._tensor_names)))
-        self._max_run_blocks = max(
-            1,
-            min(
-                int(max_coalesce_blocks),
-                iov_cap,
-                max(1, num_buffer_slots // 2),
-            ),
-        )
-
-        # Separate staging regions for stores and loads, one registration each.
-        self._store_region = StagingRegion(num_buffer_slots, self._per_tensor_bpb)
-        self._load_region = StagingRegion(num_buffer_slots, self._per_tensor_bpb)
+        # Block-major staging per direction, one registration each.
+        self._store_region = StagingRegion(num_buffer_slots * stride)
+        self._load_region = StagingRegion(num_buffer_slots * stride)
         self._store_region.register()
         try:
             self._load_region.register()
         except BaseException:
             self._store_region.unregister()
             raise
-        self._store_buffer_caches = dict(
-            zip(self._tensor_names, self._store_region.tensors)
-        )
-        self._load_buffer_caches = dict(
-            zip(self._tensor_names, self._load_region.tensors)
-        )
 
-        # Pre-built iovec views per slot (avoid per-transfer .numpy() calls)
-        self._store_slot_views = [
-            [
-                memoryview(self._store_buffer_caches[name][slot].numpy())
-                for name in self._tensor_names
-            ]
-            for slot in range(num_buffer_slots)
-        ]
-        self._load_slot_views = [
-            [
-                memoryview(self._load_buffer_caches[name][slot].numpy())
-                for name in self._tensor_names
-            ]
-            for slot in range(num_buffer_slots)
-        ]
+        gpu_bases = [t.data_ptr() for t in gpu_caches.values()]
+        offsets = [0]
+        for bpb in self._per_tensor_bpb[:-1]:
+            offsets.append(offsets[-1] + bpb)
+        n = len(gpu_bases)
 
-        self._store_params = build_params(
-            gpu_caches,
-            self._store_buffer_caches,
+        def staging_bases(region: StagingRegion) -> list[int]:
+            return [region.data_ptr() + o for o in offsets]
+
+        self._store_params = build_strided_params(
+            gpu_bases,
+            staging_bases(self._store_region),
+            self._per_tensor_bpb,
+            self._per_tensor_bpb,
+            [stride] * n,
             store_stream,
             src_access_order=CU_MEMCPY_SRC_ACCESS_ORDER_STREAM,
         )
-        self._load_params = build_params(
-            self._load_buffer_caches,
-            gpu_caches,
+        self._load_params = build_strided_params(
+            staging_bases(self._load_region),
+            gpu_bases,
+            self._per_tensor_bpb,
+            [stride] * n,
+            self._per_tensor_bpb,
             load_stream,
             src_access_order=CU_MEMCPY_SRC_ACCESS_ORDER_ANY,
         )
@@ -481,25 +482,29 @@ class DiskBackend:
             flags |= O_DIRECT
         self._fd = os.open(disk_path, flags, 0o600)
         self._disk_path = disk_path
-        os.ftruncate(self._fd, num_disk_slots * total_block_bytes)
+        os.ftruncate(self._fd, num_disk_slots * stride)
 
         if max_store_io_threads is None:
             max_store_io_threads = max(1, num_io_threads // 2)
         max_store_io_threads = max(1, min(int(max_store_io_threads), num_io_threads))
 
         logger.info(
-            "DiskBackend: path=%s, slots=%d, total=%.2f GB, staging=%d slots x "
-            "%d bytes per direction (%.2f GB pinned), io_threads=%d "
-            "(store<=%d), max_coalesce=%d blocks, page_cache=%s",
+            "DiskBackend: path=%s, slots=%d, total=%.2f GB, block=%d bytes "
+            "(%d tensors, stride %d), staging=%d slots per direction "
+            "(%.2f GB pinned), io_threads=%d (store<=%d), max IO=%d blocks "
+            "(%.1f MB), page_cache=%s",
             disk_path,
             num_disk_slots,
-            (num_disk_slots * total_block_bytes) / (1024**3),
-            num_buffer_slots,
+            (num_disk_slots * stride) / (1024**3),
             total_block_bytes,
-            2 * num_buffer_slots * total_block_bytes / (1024**3),
+            n,
+            stride,
+            num_buffer_slots,
+            2 * num_buffer_slots * stride / (1024**3),
             num_io_threads,
             max_store_io_threads,
             self._max_run_blocks,
+            self._max_run_blocks * stride / 1e6,
             use_page_cache,
         )
 
@@ -670,6 +675,12 @@ class DiskBackend:
                 self._error = exc
             self._order_lock.notify_all()
 
+    def _slot_span(self, region: StagingRegion, slots: list[int]) -> memoryview:
+        """One buffer covering contiguous staging slots."""
+        first = slots[0]
+        assert slots[-1] == first + len(slots) - 1
+        return region.view[first * self._stride : (first + len(slots)) * self._stride]
+
     # ------------------------------------------------------------- loads
 
     def _load_loop(self, device: torch.device, stream: torch.cuda.Stream) -> None:
@@ -712,12 +723,12 @@ class DiskBackend:
         ok = False
         dma_issued = False
         try:
-            views = [v for s in slots for v in self._load_slot_views[s]]
+            assert self._load_region is not None
             _rw_full(
                 os.preadv,
                 self._fd,
-                views,
-                run[0][0] * self._total_block_bytes,
+                [self._slot_span(self._load_region, slots)],
+                run[0][0] * self._stride,
                 "read",
             )
             copy_blocks(slots, [g for _, g in run], self._load_params)
@@ -805,12 +816,12 @@ class DiskBackend:
         assert self._store_slots is not None
         ok = False
         try:
-            views = [v for s in slots for v in self._store_slot_views[s]]
+            assert self._store_region is not None
             _rw_full(
                 os.pwritev,
                 self._fd,
-                views,
-                run[0][0] * self._total_block_bytes,
+                [self._slot_span(self._store_region, slots)],
+                run[0][0] * self._stride,
                 "write",
             )
             ok = True

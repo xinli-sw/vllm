@@ -191,6 +191,43 @@ class BatchMemcpyParams(NamedTuple):
     # cuMemcpyBatchAsync() with fail_idx for backward compatibility
     fail_idx: ctypes.c_size_t
     stream_handle: int  # raw cudaStream_t / CUstream
+    # Per-layer block strides when they differ from bpb (e.g. block-major
+    # staging where one block holds every layer); None means bpb.
+    src_strides: np.ndarray | None = None
+    dst_strides: np.ndarray | None = None
+
+
+def build_strided_params(
+    src_bases: list[int],
+    dst_bases: list[int],
+    sizes: list[int],
+    src_strides: list[int],
+    dst_strides: list[int],
+    stream: torch.cuda.Stream,
+    src_access_order: int = CU_MEMCPY_SRC_ACCESS_ORDER_ANY,
+) -> BatchMemcpyParams:
+    """Params copying ``sizes[i]`` bytes per block for layer ``i`` from
+    ``src_bases[i] + id * src_strides[i]`` to ``dst_bases[i] + id *
+    dst_strides[i]``."""
+    global _batch_memcpy
+    if _batch_memcpy is None:
+        _batch_memcpy = _resolve_batch_memcpy()
+    _, num_attrs = _batch_memcpy
+    assert len(src_bases) == len(dst_bases) == len(sizes)
+    assert len(sizes) == len(src_strides) == len(dst_strides)
+    return BatchMemcpyParams(
+        src_bases=np.array(src_bases, dtype=np.uint64),
+        dst_bases=np.array(dst_bases, dtype=np.uint64),
+        bpb=np.array(sizes, dtype=np.uint64),
+        num_layers=len(sizes),
+        attrs=_CUmemcpyAttributes(srcAccessOrder=src_access_order),
+        attrs_idx=ctypes.c_size_t(0),
+        num_attrs=num_attrs,
+        fail_idx=ctypes.c_size_t(0),
+        stream_handle=stream.cuda_stream,
+        src_strides=np.array(src_strides, dtype=np.uint64),
+        dst_strides=np.array(dst_strides, dtype=np.uint64),
+    )
 
 
 def build_params(
@@ -247,11 +284,13 @@ def copy_blocks(
     src_ids = np.array(src_block_ids, dtype=np.uint64)
     dst_ids = np.array(dst_block_ids, dtype=np.uint64)
 
+    src_stride = params.bpb if params.src_strides is None else params.src_strides
+    dst_stride = params.bpb if params.dst_strides is None else params.dst_strides
     src_all = (
-        params.src_bases[:, None] + src_ids[None, :] * params.bpb[:, None]
+        params.src_bases[:, None] + src_ids[None, :] * src_stride[:, None]
     ).ravel()
     dst_all = (
-        params.dst_bases[:, None] + dst_ids[None, :] * params.bpb[:, None]
+        params.dst_bases[:, None] + dst_ids[None, :] * dst_stride[:, None]
     ).ravel()
     sz_all = np.repeat(params.bpb, n)
     total = n * params.num_layers

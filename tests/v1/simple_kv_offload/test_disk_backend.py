@@ -9,6 +9,7 @@ threading, coalescing, slot management, file IO and in-order completion.
 
 from __future__ import annotations
 
+import ctypes
 import os
 import random
 import threading
@@ -37,13 +38,18 @@ class _FakeStream:
 def fake_cuda(monkeypatch):
     monkeypatch.setattr(db, "pin_tensor", lambda t: None)
     monkeypatch.setattr(db, "unpin_tensor", lambda t: None)
-    monkeypatch.setattr(db, "build_params", lambda src, dst, stream, **kw: (src, dst))
+
+    def _params(src_bases, dst_bases, sizes, src_strides, dst_strides, *a, **kw):
+        return src_bases, dst_bases, sizes, src_strides, dst_strides
+
+    monkeypatch.setattr(db, "build_strided_params", _params)
 
     def _copy(src_ids, dst_ids, params):
-        src, dst = params
-        for name in src:
+        # Host memmove with the exact pointer math cuMemcpyBatchAsync gets.
+        sb, dbs, sizes, ss, ds = params
+        for i, size in enumerate(sizes):
             for s, d in zip(src_ids, dst_ids):
-                dst[name][d].copy_(src[name][s])
+                ctypes.memmove(dbs[i] + d * ds[i], sb[i] + s * ss[i], size)
 
     monkeypatch.setattr(db, "copy_blocks", _copy)
     monkeypatch.setattr(db, "_record_event", lambda stream: _FakeEvent())
@@ -221,8 +227,8 @@ def test_coalescing(tmp_path, fake_cuda, monkeypatch):
         _wait(ev, 1)
         got = sorted((off // bpb, nbytes // bpb) for off, _, nbytes in calls)
         assert got == [(0, 4), (4, 4), (8, 2), (20, 1), (30, 2)]
-        # One iovec per tensor per block.
-        assert all(n_iov == (nb // bpb) * 2 for _, n_iov, nb in calls)
+        # Block-major staging: a whole coalesced run is one buffer.
+        assert all(n_iov == 1 for _, n_iov, _ in calls)
     finally:
         backend.shutdown()
 
@@ -488,13 +494,7 @@ def test_staging_is_page_aligned_and_reinit_works(tmp_path, fake_cuda, monkeypat
             for region in (backend._store_region, backend._load_region):
                 assert region.base.data_ptr() % page == 0
                 assert region.nbytes % page == 0
-                for t in region.tensors:
-                    assert t.data_ptr() % 4096 == 0
-                    assert region.base.data_ptr() <= t.data_ptr()
-                    assert (
-                        t.data_ptr() + t.nbytes
-                        <= region.base.data_ptr() + region.nbytes
-                    )
+                assert region.nbytes >= 3 * backend._stride
             # The data path still round-trips through the new staging.
             _fill(gpu, range(4), seed=7)
             expected = {n: t[:4].clone() for n, t in gpu.items()}
@@ -510,3 +510,102 @@ def test_staging_is_page_aligned_and_reinit_works(tmp_path, fake_cuda, monkeypat
             backend.shutdown()
         assert reg.registers == reg.unregisters
         assert not reg.pages
+
+
+def test_unaligned_layers_block_major_layout(tmp_path, fake_cuda, monkeypatch):
+    """Many small, non-4 KiB layers (MiniMax-like): each block is stored
+    contiguously at slot * stride (stride padded to 4 KiB), every coalesced
+    run is one single-buffer syscall, and data round-trips."""
+    tensor_bytes = (14581, 14583, 1000, 4096, 777)
+    total = sum(tensor_bytes)
+    stride = (total + 4095) // 4096 * 4096
+    calls: list[tuple[int, int, int]] = []
+    real_pwritev, real_preadv = os.pwritev, os.preadv
+
+    def spy(real):
+        def f(fd, bufs, off):
+            calls.append((off, len(bufs), sum(memoryview(b).nbytes for b in bufs)))
+            return real(fd, bufs, off)
+
+        return f
+
+    monkeypatch.setattr(os, "pwritev", spy(real_pwritev))
+    monkeypatch.setattr(os, "preadv", spy(real_preadv))
+    backend, gpu = _make_backend(
+        tmp_path,
+        tensor_bytes=tensor_bytes,
+        num_buffer_slots=8,
+        max_coalesce_blocks=4,
+    )
+    try:
+        assert backend._stride == stride
+        assert os.path.getsize(tmp_path / "kv.bin") == 128 * stride
+        _fill(gpu, range(6), seed=11)
+        expected = {n: t[:6].clone() for n, t in gpu.items()}
+        ev: list = []
+        disk = [40, 41, 42, 43, 44, 7]
+        backend.launch_copy(list(range(6)), disk, True, 0, ev)
+        _wait(ev, 1)
+        assert sorted((o // stride, n, nb // stride) for o, n, nb in calls) == [
+            (7, 1, 1),
+            (40, 1, 4),
+            (44, 1, 1),
+        ]
+        assert all(o % 4096 == 0 for o, _, _ in calls)
+        with open(tmp_path / "kv.bin", "rb") as f:
+            for g, slot in enumerate(disk):
+                f.seek(slot * stride)
+                raw = f.read(total)
+                want = b"".join(expected[n][g].numpy().tobytes() for n in expected)
+                assert raw == want, (g, slot)
+        calls.clear()
+        ev = []
+        backend.launch_copy(disk, list(range(10, 16)), False, 0, ev)
+        _wait(ev, 1)
+        assert all(n == 1 for _, n, _ in calls)
+        for n, t in gpu.items():
+            assert torch.equal(t[10:16], expected[n])
+    finally:
+        backend.shutdown()
+
+
+def test_max_io_bytes_caps_run_length(tmp_path, fake_cuda):
+    backend, _ = _make_backend(
+        tmp_path,
+        tensor_bytes=(4096, 4096),
+        max_coalesce_blocks=32,
+        max_io_bytes=3 * 8192,
+        num_buffer_slots=64,
+    )
+    try:
+        assert backend._max_run_blocks == 3
+    finally:
+        backend.shutdown()
+
+
+def test_staging_slots_sized_from_bytes(tmp_path, fake_cuda):
+    backend, _ = _make_backend(
+        tmp_path,
+        tensor_bytes=(4096, 4096),
+        num_buffer_slots=None,
+        staging_bytes=40 * 8192,
+        max_io_bytes=4 * 8192,
+    )
+    try:
+        assert backend._num_buffer_slots == 40
+        assert backend._max_run_blocks == 4
+    finally:
+        backend.shutdown()
+
+
+def test_slot_pool_hands_out_contiguous_ranges():
+    pool = db._SlotPool(8)
+    a = pool.acquire(3)
+    b = pool.acquire(2)
+    assert a == [0, 1, 2] and b == [3, 4]
+    pool.release(a)
+    # 3 free at the front and 3 at the back, but no run of 4.
+    assert pool.try_acquire(4) is None
+    assert pool.try_acquire(3) == [0, 1, 2]
+    pool.release(b)
+    assert pool.try_acquire(5) == [3, 4, 5, 6, 7]

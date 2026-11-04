@@ -12,9 +12,10 @@ from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.simple_kv_offload.copy_backend import DmaCopyBackend
 from vllm.v1.simple_kv_offload.cuda_mem_ops import pin_tensor
 from vllm.v1.simple_kv_offload.disk_backend import (
-    DEFAULT_DISK_BUFFER_SLOTS,
     DEFAULT_DISK_IO_THREADS,
     DEFAULT_DISK_MAX_COALESCE_BLOCKS,
+    DEFAULT_DISK_MAX_IO_BYTES,
+    DEFAULT_DISK_STAGING_BYTES,
     DiskBackend,
 )
 from vllm.v1.simple_kv_offload.metadata import (
@@ -40,12 +41,14 @@ class SimpleCPUOffloadWorker:
         kv_offload_backend: str = "cpu",
         disk_path: str | None = None,
         disk_capacity_bytes: int = 0,
-        disk_buffer_slots: int = DEFAULT_DISK_BUFFER_SLOTS,
+        disk_buffer_slots: int | None = None,
         use_page_cache: bool = False,
         num_cpu_blocks: int | None = None,
         disk_io_threads: int = DEFAULT_DISK_IO_THREADS,
         disk_max_coalesce_blocks: int = DEFAULT_DISK_MAX_COALESCE_BLOCKS,
         disk_store_io_threads: int | None = None,
+        disk_max_io_bytes: int = DEFAULT_DISK_MAX_IO_BYTES,
+        disk_staging_bytes: int = DEFAULT_DISK_STAGING_BYTES,
     ):
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
@@ -57,6 +60,8 @@ class SimpleCPUOffloadWorker:
         self.disk_io_threads = disk_io_threads
         self.disk_max_coalesce_blocks = disk_max_coalesce_blocks
         self.disk_store_io_threads = disk_store_io_threads
+        self.disk_max_io_bytes = disk_max_io_bytes
+        self.disk_staging_bytes = disk_staging_bytes
         self.use_page_cache = use_page_cache
         self.disk_mode = kv_offload_backend == "disk"
 
@@ -236,6 +241,8 @@ class SimpleCPUOffloadWorker:
             num_io_threads=self.disk_io_threads,
             max_coalesce_blocks=self.disk_max_coalesce_blocks,
             max_store_io_threads=self.disk_store_io_threads,
+            max_io_bytes=self.disk_max_io_bytes,
+            staging_bytes=self.disk_staging_bytes,
         )
 
     def _init_cpu_mode(

@@ -14,8 +14,14 @@ threads, no GPU).
 
 Examples (GB200 tray, md0 mounted at /mnt/nvme)::
 
-    # Default MiniMax-M3.1-like block (~5.63 MB, 8 tensors), new vs legacy
+    # Default: MiniMax-M3.1 TP4 rank layout (1.8227 MB block over 125 tensors
+    # of ~14.6 KB). Legacy issues 125-iovec preadv/pwritev per block, which
+    # NVMe splits into ~10-15 KB requests; new issues one buffer per run.
     python benchmarks/kv_offload/bench_disk_backend.py --disk-dir /mnt/nvme/kvbench
+
+    # DEP prefill layout used earlier (~5.63 MB over 8 tensors)
+    python benchmarks/kv_offload/bench_disk_backend.py --disk-dir /mnt/nvme/kvbench \
+        --block-bytes 5632000 --num-tensors 8
 
     # Whole-tray picture: 4 GPUs hammering the same RAID at once
     python benchmarks/kv_offload/bench_disk_backend.py --disk-dir /mnt/nvme/kvbench \\
@@ -166,15 +172,25 @@ def _make_legacy_cls():
             names = list(gpu_caches)
             # Same page-aligned, unregistered-on-shutdown staging as the new
             # backend; "legacy" here means the old IO pattern only.
+            # Old per-tensor layout ([tensor][slot][bpb]), each tensor's
+            # buffer 4 KiB aligned, so a block is one iovec per tensor.
             bpbs = [g.stride(0) * g.element_size() for g in gpu_caches.values()]
-            self._regions = [
-                StagingRegion(num_buffer_slots, bpbs),
-                StagingRegion(num_buffer_slots, bpbs),
-            ]
+            offs, off = [], 0
+            for bpb in bpbs:
+                offs.append(off)
+                off += (num_buffer_slots * bpb + ALIGN - 1) // ALIGN * ALIGN
+            self._regions = [StagingRegion(off), StagingRegion(off)]
             for r in self._regions:
                 r.register()
-            self._sbuf = dict(zip(names, self._regions[0].tensors))
-            self._lbuf = dict(zip(names, self._regions[1].tensors))
+
+            def per_tensor(r):
+                return {
+                    n: r.base[o : o + num_buffer_slots * b].view(num_buffer_slots, b)
+                    for n, o, b in zip(names, offs, bpbs)
+                }
+
+            self._sbuf = per_tensor(self._regions[0])
+            self._lbuf = per_tensor(self._regions[1])
             self._sviews = [
                 [memoryview(self._sbuf[n][s].numpy()) for n in names]
                 for s in range(num_buffer_slots)
@@ -317,12 +333,13 @@ class Row:
     verified: bool | None = None
 
 
-def _tensor_sizes(block_bytes: int, num_tensors: int) -> list[int]:
-    base = max(ALIGN, (block_bytes // num_tensors) // ALIGN * ALIGN)
-    sizes = [base] * num_tensors
-    rest = block_bytes - base * num_tensors
-    if rest > 0:
-        sizes[-1] += (rest + ALIGN - 1) // ALIGN * ALIGN
+def _tensor_sizes(block_bytes: int, num_tensors: int, align: int) -> list[int]:
+    """Split ``block_bytes`` over tensors in ``align``-byte units (sum exact)."""
+    units, rest = divmod(block_bytes, align)
+    base, extra = divmod(units, num_tensors)
+    sizes = [(base + (1 if i < extra else 0)) * align for i in range(num_tensors)]
+    sizes[-1] += rest
+    assert all(x > 0 for x in sizes), "too many tensors for block size"
     return sizes
 
 
@@ -384,9 +401,13 @@ def backend_sweep(args, rank: int, barrier) -> list[Row]:
 
     torch.cuda.set_device(rank)
     device = torch.device("cuda", rank)
-    sizes = _tensor_sizes(args.block_bytes, args.num_tensors)
+    sizes = _tensor_sizes(args.block_bytes, args.num_tensors, args.tensor_align)
     block_bytes = sum(sizes)
-    num_slots = int(args.disk_gb * (1 << 30)) // block_bytes
+    # New backend pads each block to 4 KiB on disk; size the slot count so
+    # both backends fit in --disk-gb.
+    num_slots = int(args.disk_gb * (1 << 30)) // (
+        (block_bytes + ALIGN - 1) // ALIGN * ALIGN
+    )
     gpu = {
         f"layer{i}": torch.randint(
             -128, 127, (args.num_gpu_blocks, b), dtype=torch.int8, device=device
@@ -404,19 +425,20 @@ def backend_sweep(args, rank: int, barrier) -> list[Row]:
             for inflight, bb, layout in itertools.product(
                 args.inflight, args.batch_blocks, args.layouts
             ):
-                configs.append((be, inflight, bb, 1, 2, 1, layout))
+                configs.append((be, inflight, bb, 1, 2, 1, 0.0, layout))
         elif be == "new":
-            for inflight, bb, th, sl, co, layout in itertools.product(
+            for inflight, bb, th, sl, co, mio, layout in itertools.product(
                 args.inflight,
                 args.batch_blocks,
                 args.io_threads,
                 args.buffer_slots,
                 args.coalesce,
+                args.max_io_mb,
                 args.layouts,
             ):
-                configs.append((be, inflight, bb, th, sl, co, layout))
+                configs.append((be, inflight, bb, th, sl, co, mio, layout))
 
-    for be, inflight, bb, th, sl, co, layout in configs:
+    for be, inflight, bb, th, sl, co, mio, layout in configs:
         n_batches = max(inflight * 2, args.total_blocks // bb)
         batches = _make_batches(
             n_batches, bb, args.num_gpu_blocks, num_slots, layout, seed=rank
@@ -431,11 +453,14 @@ def backend_sweep(args, rank: int, barrier) -> list[Row]:
             path,
             num_slots,
             block_bytes,
-            num_buffer_slots=sl,
+            num_buffer_slots=sl or None,
             use_page_cache=args.use_page_cache,
             num_io_threads=th,
             max_coalesce_blocks=co,
+            max_io_bytes=int(mio * (1 << 20)) if mio else 1 << 62,
         )
+        eff_slots = getattr(backend, "_num_buffer_slots", sl)
+        eff_run = getattr(backend, "_max_run_blocks", co)
         try:
             n_bytes = n_batches * bb * block_bytes
             for op, is_store in (("store", True), ("load", False)):
@@ -476,8 +501,8 @@ def backend_sweep(args, rank: int, barrier) -> list[Row]:
                         inflight=inflight,
                         batch_blocks=bb,
                         io_threads=th,
-                        buffer_slots=sl,
-                        coalesce=co,
+                        buffer_slots=eff_slots,
+                        coalesce=eff_run,
                         layout=layout,
                         io_mb=round(block_bytes / 1e6, 3),
                         gbps=n_bytes / secs / 1e9,
@@ -628,10 +653,17 @@ def main() -> None:
     p.add_argument(
         "--block-bytes",
         type=int,
-        default=5_632_000,
-        help="bytes per KV block per rank (rounded up to 4 KiB per tensor)",
+        default=1_822_720,
+        help="bytes per KV block per rank (sum over all tensors)",
     )
-    p.add_argument("--num-tensors", type=int, default=8)
+    p.add_argument("--num-tensors", type=int, default=125)
+    p.add_argument(
+        "--tensor-align",
+        type=int,
+        default=512,
+        help="per-tensor byte granularity (512 keeps legacy O_DIRECT iovecs "
+        "valid; real layers are not 4 KiB multiples)",
+    )
     p.add_argument("--num-gpu-blocks", type=int, default=256)
     p.add_argument("--disk-gb", type=float, default=32.0, help="backend file size")
     p.add_argument(
@@ -644,13 +676,26 @@ def main() -> None:
     p.add_argument("--inflight", type=_ints, default=[1, 4, 16])
     p.add_argument("--batch-blocks", type=_ints, default=[8, 64])
     p.add_argument("--io-threads", type=_ints, default=[4, 8])
-    p.add_argument("--buffer-slots", type=_ints, default=[16])
-    p.add_argument("--coalesce", type=_ints, default=[1, 4])
+    p.add_argument(
+        "--buffer-slots",
+        type=_ints,
+        default=[0],
+        help="staging slots per direction; 0 = backend default (sized in bytes)",
+    )
+    p.add_argument("--coalesce", type=_ints, default=[32], help="max blocks per IO")
+    p.add_argument(
+        "--max-io-mb", type=_floats, default=[16.0], help="max bytes per IO (MiB)"
+    )
     p.add_argument("--layouts", default="random,contiguous")
     p.add_argument("--use-page-cache", action="store_true")
     p.add_argument("--verify", action="store_true", help="check load == store data")
     p.add_argument("--raw-threads", type=_ints, default=[1, 8, 32])
-    p.add_argument("--raw-io-mb", type=_floats, default=[5.5, 22])
+    p.add_argument(
+        "--raw-io-mb",
+        type=_floats,
+        default=[0.015, 1.82, 16],
+        help="raw IO sizes (MiB); 0.015 ~ one layer of the default layout",
+    )
     p.add_argument("--raw-seconds", type=float, default=5.0)
     p.add_argument("--raw-file-gb", type=float, default=16.0)
     p.add_argument("--raw-pattern", choices=["random", "sequential"], default="random")
@@ -701,7 +746,7 @@ def main() -> None:
     rows = _aggregate(per_rank)
     print()
     print(
-        f"block={sum(_tensor_sizes(args.block_bytes, args.num_tensors)) / 1e6:.3f} MB"
+        f"block={args.block_bytes / 1e6:.4f} MB"
         f" ({args.num_tensors} tensors), page_cache={args.use_page_cache}, "
         f"procs={args.num_procs}; GB/s is aggregate across procs"
     )

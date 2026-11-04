@@ -751,67 +751,55 @@ def test_mixed_page_byte_placement_is_dcp_invariant():
 
 
 @pytest.mark.parametrize(
-    ("block_bytes", "use_page_cache", "expect_ok"),
+    ("block_bytes", "use_page_cache"),
     [
-        (4096, True, True),  # aligned control
-        (3 * 512, True, True),  # 512-aligned only: fine for buffered I/O
-        (3 * 512, False, False),  # O_DIRECT keeps enforcing 4096 alignment
+        (4096, True),
+        (3 * 512, True),
+        (3 * 512, False),  # O_DIRECT: unaligned blocks are padded, not rejected
+        (14581, False),
     ],
 )
-def test_disk_backend_alignment_only_required_for_direct_io(
-    tmp_path, monkeypatch, block_bytes: int, use_page_cache: bool, expect_ok: bool
+def test_disk_backend_pads_unaligned_blocks(
+    tmp_path, monkeypatch, block_bytes: int, use_page_cache: bool
 ):
-    """The 4096 stride assert belongs to O_DIRECT; page-cache I/O must not hit it.
-
-    Hybrid models (e.g. 101 per-rank cache tensors) sum to a block stride that
-    is 512- but not 4096-aligned, which previously made disk offload unbootable
-    even with use_page_cache=True.
-    """
-    # Host pinning is a separate lifecycle concern with its own tests; the
-    # alignment gate must not depend on registration state, so stub both ends.
+    """Hybrid models (e.g. 125 per-rank cache tensors) have block sizes that
+    are not 4 KiB multiples. The disk/staging stride is padded to 4 KiB so
+    O_DIRECT works for them, and page-cache mode keeps working."""
     monkeypatch.setattr(
         "vllm.v1.simple_kv_offload.disk_backend.pin_tensor", lambda t: None
     )
     monkeypatch.setattr(
-        "vllm.v1.simple_kv_offload.disk_backend.unpin_tensor",
-        lambda t: None,
-        raising=False,  # harmless on branches without teardown-side unpins
+        "vllm.v1.simple_kv_offload.disk_backend.unpin_tensor", lambda t: None
     )
     num_blocks = 4
     gpu = {"k": torch.zeros((num_blocks, block_bytes), dtype=torch.int8, device="cuda")}
     backend = DiskBackend()
     disk_path = tmp_path / "kv-offload.bin"
-
-    def _init() -> None:
-        backend.init(
-            gpu,
-            gpu["k"].device,
-            torch.cuda.Stream(),
-            torch.cuda.Stream(),
-            str(disk_path),
-            num_blocks,
-            block_bytes,
-            use_page_cache=use_page_cache,
-        )
-
-    if not expect_ok:
-        with pytest.raises(AssertionError, match="not aligned"):
-            _init()
-        return
-
-    _init()
+    backend.init(
+        gpu,
+        gpu["k"].device,
+        torch.cuda.Stream(),
+        torch.cuda.Stream(),
+        str(disk_path),
+        num_blocks,
+        block_bytes,
+        use_page_cache=use_page_cache,
+    )
     try:
-        assert disk_path.stat().st_size == num_blocks * block_bytes
+        stride = (block_bytes + 4095) // 4096 * 4096
+        assert disk_path.stat().st_size == num_blocks * stride
     finally:
         backend.shutdown()
 
 
+@pytest.mark.parametrize("tensor_bytes", [(8192, 4096, 4096), (14581, 14583, 1000)])
 @pytest.mark.parametrize("use_page_cache", [True, False])
-def test_disk_backend_gpu_round_trip_many_batches(tmp_path, use_page_cache: bool):
+def test_disk_backend_gpu_round_trip_many_batches(
+    tmp_path, use_page_cache: bool, tensor_bytes: tuple[int, ...]
+):
     """Real CUDA DMA + disk IO: many concurrent batches round-trip intact and
     report their events in launch order."""
     num_blocks = 64
-    tensor_bytes = (8192, 4096, 4096)
     gpu = {
         f"t{i}": torch.randint(
             -128, 127, (num_blocks, b), dtype=torch.int8, device="cuda"

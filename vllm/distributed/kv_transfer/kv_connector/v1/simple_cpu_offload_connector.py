@@ -27,9 +27,10 @@ from vllm.v1.metrics.cache_hit_source import CacheHitSource
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.simple_kv_offload.disk_backend import (
     DEFAULT_DISK_ALLOC_WINDOW_BLOCKS,
-    DEFAULT_DISK_BUFFER_SLOTS,
     DEFAULT_DISK_IO_THREADS,
     DEFAULT_DISK_MAX_COALESCE_BLOCKS,
+    DEFAULT_DISK_MAX_IO_BYTES,
+    DEFAULT_DISK_STAGING_BYTES,
 )
 from vllm.v1.simple_kv_offload.manager import (
     BoundaryStoreStats,
@@ -71,6 +72,8 @@ _DISK_ONLY_KEYS = (
     "disk_max_coalesce_blocks",
     "disk_store_io_threads",
     "disk_alloc_window_blocks",
+    "disk_max_io_bytes",
+    "disk_staging_bytes",
 )
 
 
@@ -159,11 +162,18 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         disk_capacity_bytes = int(
             extra_config.get("disk_capacity_bytes", 100 * (1024**3))
         )
-        # Disk data path: staging slots per direction (pinned host memory is
-        # 2 * disk_buffer_slots * block bytes per rank), IO threads shared by
-        # loads and stores, and the max contiguous blocks per preadv/pwritev.
-        disk_buffer_slots = max(
-            1, int(extra_config.get("disk_buffer_slots", DEFAULT_DISK_BUFFER_SLOTS))
+        # Disk data path: pinned staging per direction (disk_staging_bytes, or
+        # disk_buffer_slots blocks if set), IO threads shared by loads and
+        # stores, and the largest single IO (disk_max_io_bytes, at most
+        # disk_max_coalesce_blocks contiguous blocks).
+        disk_buffer_slots = extra_config.get("disk_buffer_slots")
+        if disk_buffer_slots is not None:
+            disk_buffer_slots = max(1, int(disk_buffer_slots))
+        disk_staging_bytes = max(
+            1, int(extra_config.get("disk_staging_bytes", DEFAULT_DISK_STAGING_BYTES))
+        )
+        disk_max_io_bytes = max(
+            1, int(extra_config.get("disk_max_io_bytes", DEFAULT_DISK_MAX_IO_BYTES))
         )
         disk_io_threads = max(
             1, int(extra_config.get("disk_io_threads", DEFAULT_DISK_IO_THREADS))
@@ -277,6 +287,8 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 disk_io_threads=disk_io_threads,
                 disk_max_coalesce_blocks=disk_max_coalesce_blocks,
                 disk_store_io_threads=disk_store_io_threads,
+                disk_max_io_bytes=disk_max_io_bytes,
+                disk_staging_bytes=disk_staging_bytes,
             )
 
     # --- Worker-side methods ---
