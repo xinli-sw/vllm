@@ -377,7 +377,19 @@ class SimpleCPUOffloadWorker:
         self._flush_and_sync_all()
 
     def _flush_and_sync_all(self) -> None:
-        """Synchronize all in-flight transfer events."""
+        """Synchronize all in-flight transfer events.
+
+        Backends that report events asynchronously (DiskBackend appends a
+        batch's event only once its IO is done) are drained first, so batches
+        that are queued or mid-IO are covered too, not just the ones whose
+        events have already been appended.
+        """
+        flush = getattr(self._backend, "flush", None)
+        if flush is not None and not flush():
+            logger.error(
+                "SimpleCPUOffloadWorker: offload backend flush failed; "
+                "some transfers did not complete"
+            )
         for event_idx, event in self._load_events:
             event.synchronize()
             self._load_hwm = event_idx
