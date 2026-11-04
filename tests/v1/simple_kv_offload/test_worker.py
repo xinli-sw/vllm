@@ -804,3 +804,60 @@ def test_disk_backend_alignment_only_required_for_direct_io(
         assert disk_path.stat().st_size == num_blocks * block_bytes
     finally:
         backend.shutdown()
+
+
+@pytest.mark.parametrize("use_page_cache", [True, False])
+def test_disk_backend_gpu_round_trip_many_batches(tmp_path, use_page_cache: bool):
+    """Real CUDA DMA + disk IO: many concurrent batches round-trip intact and
+    report their events in launch order."""
+    num_blocks = 64
+    tensor_bytes = (8192, 4096, 4096)
+    gpu = {
+        f"t{i}": torch.randint(
+            -128, 127, (num_blocks, b), dtype=torch.int8, device="cuda"
+        )
+        for i, b in enumerate(tensor_bytes)
+    }
+    expected = {n: t.clone() for n, t in gpu.items()}
+    backend = DiskBackend()
+    backend.init(
+        gpu,
+        gpu["t0"].device,
+        torch.cuda.Stream(),
+        torch.cuda.Stream(),
+        str(tmp_path / "kv-offload.bin"),
+        num_blocks * 2,
+        sum(tensor_bytes),
+        num_buffer_slots=8,
+        use_page_cache=use_page_cache,
+        num_io_threads=8,
+        max_coalesce_blocks=4,
+    )
+    try:
+        disk = [(i * 7) % (num_blocks * 2) for i in range(num_blocks)]
+        store_events: list = []
+        for idx in range(8):
+            sl = slice(idx * 8, idx * 8 + 8)
+            backend.launch_copy(
+                list(range(num_blocks))[sl], disk[sl], True, idx, store_events
+            )
+        assert backend.flush(timeout=60.0)
+        assert [i for i, _ in store_events] == list(range(8))
+        for t in gpu.values():
+            t.zero_()
+        torch.accelerator.synchronize()
+
+        load_events: list = []
+        for idx in range(16):
+            sl = slice(idx * 4, idx * 4 + 4)
+            backend.launch_copy(
+                disk[sl], list(range(num_blocks))[sl], False, idx, load_events
+            )
+        assert backend.flush(timeout=60.0)
+        assert [i for i, _ in load_events] == list(range(16))
+        for _, ev in load_events:
+            ev.synchronize()
+        for n, t in gpu.items():
+            assert torch.equal(t, expected[n]), n
+    finally:
+        backend.shutdown()

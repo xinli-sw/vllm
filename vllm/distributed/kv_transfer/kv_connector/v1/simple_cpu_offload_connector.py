@@ -25,6 +25,11 @@ from vllm.logger import init_logger
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
 from vllm.v1.outputs import KVConnectorOutput
+from vllm.v1.simple_kv_offload.disk_backend import (
+    DEFAULT_DISK_BUFFER_SLOTS,
+    DEFAULT_DISK_IO_THREADS,
+    DEFAULT_DISK_MAX_COALESCE_BLOCKS,
+)
 from vllm.v1.simple_kv_offload.manager import (
     BoundaryStoreStats,
     SimpleCPUOffloadScheduler,
@@ -61,6 +66,9 @@ _DISK_ONLY_KEYS = (
     "disk_capacity_bytes",
     "disk_buffer_slots",
     "use_page_cache",
+    "disk_io_threads",
+    "disk_max_coalesce_blocks",
+    "disk_store_io_threads",
 )
 
 
@@ -149,7 +157,28 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         disk_capacity_bytes = int(
             extra_config.get("disk_capacity_bytes", 100 * (1024**3))
         )
-        disk_buffer_slots = max(1, int(extra_config.get("disk_buffer_slots", 2)))
+        # Disk data path: staging slots per direction (pinned host memory is
+        # 2 * disk_buffer_slots * block bytes per rank), IO threads shared by
+        # loads and stores, and the max contiguous blocks per preadv/pwritev.
+        disk_buffer_slots = max(
+            1, int(extra_config.get("disk_buffer_slots", DEFAULT_DISK_BUFFER_SLOTS))
+        )
+        disk_io_threads = max(
+            1, int(extra_config.get("disk_io_threads", DEFAULT_DISK_IO_THREADS))
+        )
+        disk_max_coalesce_blocks = max(
+            1,
+            int(
+                extra_config.get(
+                    "disk_max_coalesce_blocks", DEFAULT_DISK_MAX_COALESCE_BLOCKS
+                )
+            ),
+        )
+        # Cap on IO threads running stores at once (default: half), so loads
+        # always find a free thread.
+        disk_store_io_threads = extra_config.get("disk_store_io_threads")
+        if disk_store_io_threads is not None:
+            disk_store_io_threads = max(1, int(disk_store_io_threads))
         use_page_cache = bool(extra_config.get("use_page_cache", False))
 
         if disk_mode:
@@ -231,6 +260,9 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
                 disk_buffer_slots=disk_buffer_slots,
                 use_page_cache=use_page_cache,
                 num_cpu_blocks=num_cpu_blocks,
+                disk_io_threads=disk_io_threads,
+                disk_max_coalesce_blocks=disk_max_coalesce_blocks,
+                disk_store_io_threads=disk_store_io_threads,
             )
 
     # --- Worker-side methods ---

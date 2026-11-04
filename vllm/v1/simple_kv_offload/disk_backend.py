@@ -2,17 +2,40 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Disk I/O backend for GPU<->NVMe block transfers via pinned staging buffers.
 
-Uses separate IO threads for store and load so that loads (latency-critical)
-never block behind stores (background work). Each thread owns its own pinned
-staging buffers to avoid contention.
+Data path (high queue depth):
+
+- Each ``launch_copy`` call is one *batch*. A per-direction coordinator thread
+  splits a batch into *runs* of blocks whose disk slots are contiguous (up to
+  ``max_coalesce_blocks``), so a run is a single ``preadv``/``pwritev``.
+- Runs are executed by a shared pool of IO threads (``preadv``/``pwritev``
+  release the GIL), so many reads/writes are in flight at once.
+- Each direction owns a ring of pinned, O_DIRECT-aligned staging slots. A load
+  run reads into its slots and immediately issues the H2D DMA, so DMA of
+  finished runs overlaps with further reads. Slots return to the pool once
+  their DMA completes. A store run is DMA'd into staging by the coordinator and
+  handed to an IO thread once that DMA has completed.
+- Loads have priority over stores: IO threads always prefer queued load runs,
+  and at most ``max_store_io`` threads may run stores at the same time, so
+  stores can never occupy every thread. Stores use their own staging ring.
+- Batches are issued in parallel but *completed in order*: a batch's event is
+  appended to the worker's ``events_list`` only once it and every earlier
+  batch of the same direction are done, preserving the worker's in-order
+  high-water-mark logic.
+
+Same ``launch_copy`` interface as DmaCopyBackend so the worker can swap
+backends without changing calling code.
 """
 
 from __future__ import annotations
 
 import contextlib
+import functools
 import os
 import queue
 import threading
+from collections import deque
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 
 import torch
 
@@ -32,6 +55,22 @@ logger = init_logger(__name__)
 O_DIRECT = getattr(os, "O_DIRECT", 0)
 _ALIGNMENT = 4096
 
+# Defaults, overridable through kv_connector_extra_config.
+DEFAULT_DISK_IO_THREADS = 16
+DEFAULT_DISK_BUFFER_SLOTS = 32
+DEFAULT_DISK_MAX_COALESCE_BLOCKS = 4
+
+
+def _iov_max() -> int:
+    try:
+        v = os.sysconf("SC_IOV_MAX")
+    except (AttributeError, ValueError, OSError):
+        v = -1
+    return v if v > 0 else 1024
+
+
+_IOV_MAX = _iov_max()
+
 
 def _alloc_aligned(num_slots: int, bpb: int) -> torch.Tensor:
     """Allocate a staging buffer whose base address is O_DIRECT aligned.
@@ -46,17 +85,204 @@ def _alloc_aligned(num_slots: int, bpb: int) -> torch.Tensor:
     return raw[offset : offset + nbytes].view(num_slots, bpb)
 
 
-class DiskBackend:
-    """Async disk offload backend with pipelined GPU DMA and interleaved IO.
+def _record_event(stream: torch.cuda.Stream) -> torch.Event:
+    event = torch.Event()
+    event.record(stream)
+    return event
 
-    Architecture:
-    - Separate coordinator threads for store and load (never block each other)
-    - Interleaved pipeline: DMA slot N while preadv/pwritev slot N-1
-    - O_DIRECT by default; page cache is opt-in via use_page_cache
 
-    Same launch_copy interface as DmaCopyBackend so the worker can swap
-    backends without changing calling code.
+def _rw_full(
+    fn: Callable[[int, Sequence[memoryview], int], int],
+    fd: int,
+    views: list[memoryview],
+    offset: int,
+    what: str,
+) -> None:
+    """Run preadv/pwritev over ``views`` until every byte is transferred.
+
+    Splits at IOV_MAX and resumes after short transfers. A zero-length
+    transfer (EOF / no progress) is an error.
     """
+    i = 0
+    while i < len(views):
+        chunk = views[i : i + _IOV_MAX]
+        want = sum(v.nbytes for v in chunk)
+        done = fn(fd, chunk, offset)
+        if done <= 0:
+            raise OSError(
+                f"Short {what}: expected {want} bytes at {offset}, got {done}"
+            )
+        offset += done
+        if done == want:
+            i += len(chunk)
+            continue
+        # Partial transfer: skip fully covered iovecs, trim the next one.
+        for v in chunk:
+            if done >= v.nbytes:
+                done -= v.nbytes
+                i += 1
+            else:
+                views = views[:i] + [v[done:]] + views[i + 1 :]
+                break
+
+
+def _split_runs(
+    pairs: list[tuple[int, int]], max_run: int
+) -> list[list[tuple[int, int]]]:
+    """Group (disk_slot, other) pairs into runs of consecutive disk slots.
+
+    ``pairs`` are sorted by disk slot first; each run has strictly consecutive
+    disk slots and at most ``max_run`` entries.
+    """
+    pairs = sorted(pairs, key=lambda p: p[0])
+    runs: list[list[tuple[int, int]]] = []
+    cur: list[tuple[int, int]] = []
+    for p in pairs:
+        if cur and (p[0] != cur[-1][0] + 1 or len(cur) >= max_run):
+            runs.append(cur)
+            cur = []
+        cur.append(p)
+    if cur:
+        runs.append(cur)
+    return runs
+
+
+class _BackendShutdown(Exception):
+    pass
+
+
+class _SlotPool:
+    """Pinned staging slots, optionally released only after a DMA event."""
+
+    def __init__(self, num_slots: int) -> None:
+        self.num_slots = num_slots
+        self._free: deque[int] = deque(range(num_slots))
+        self._pending: deque[tuple[torch.Event, list[int]]] = deque()
+        self._cond = threading.Condition()
+        self._closed = False
+
+    def _reclaim_locked(self) -> None:
+        while self._pending and self._pending[0][0].query():
+            self._free.extend(self._pending.popleft()[1])
+
+    def try_acquire(self, k: int) -> list[int] | None:
+        with self._cond:
+            self._reclaim_locked()
+            if len(self._free) >= k:
+                return [self._free.popleft() for _ in range(k)]
+            return None
+
+    def acquire(self, k: int) -> list[int]:
+        assert 0 < k <= self.num_slots
+        while True:
+            to_sync: tuple[torch.Event, list[int]] | None = None
+            with self._cond:
+                self._reclaim_locked()
+                if len(self._free) >= k:
+                    return [self._free.popleft() for _ in range(k)]
+                if self._pending:
+                    to_sync = self._pending.popleft()
+                elif self._closed:
+                    raise _BackendShutdown
+                else:
+                    self._cond.wait(timeout=1.0)
+                    continue
+            # Block on the oldest outstanding DMA without holding the lock.
+            to_sync[0].synchronize()
+            self.release(to_sync[1])
+
+    def release(self, slots: list[int]) -> None:
+        with self._cond:
+            self._free.extend(slots)
+            self._cond.notify_all()
+
+    def release_after(self, event: torch.Event, slots: list[int]) -> None:
+        with self._cond:
+            self._pending.append((event, slots))
+            self._cond.notify_all()
+
+    def close(self) -> None:
+        with self._cond:
+            self._closed = True
+            self._cond.notify_all()
+
+
+class _IOPool:
+    """IO thread pool with two priority classes (loads before stores)."""
+
+    def __init__(
+        self, num_threads: int, max_store_io: int, device: torch.device | None
+    ) -> None:
+        self._loads: deque[Callable[[], None]] = deque()
+        self._stores: deque[Callable[[], None]] = deque()
+        self._cond = threading.Condition()
+        self._max_store_io = max(1, max_store_io)
+        self._store_running = 0
+        self._stop = False
+        self._device = device
+        self._threads = [
+            threading.Thread(target=self._run, name=f"kv-disk-io-{i}", daemon=True)
+            for i in range(num_threads)
+        ]
+        for t in self._threads:
+            t.start()
+
+    def submit(self, job: Callable[[], None], is_store: bool) -> None:
+        with self._cond:
+            (self._stores if is_store else self._loads).append(job)
+            self._cond.notify()
+
+    def _next_job(self) -> tuple[Callable[[], None], bool] | None:
+        with self._cond:
+            while True:
+                if self._loads:
+                    return self._loads.popleft(), False
+                if self._stores and self._store_running < self._max_store_io:
+                    self._store_running += 1
+                    return self._stores.popleft(), True
+                if self._stop and not self._loads and not self._stores:
+                    return None
+                self._cond.wait()
+
+    def _run(self) -> None:
+        if self._device is not None:
+            current_platform.set_device(self._device)
+        while True:
+            nxt = self._next_job()
+            if nxt is None:
+                return
+            job, is_store = nxt
+            try:
+                job()
+            finally:
+                if is_store:
+                    with self._cond:
+                        self._store_running -= 1
+                        self._cond.notify_all()
+
+    def shutdown(self, timeout: float) -> bool:
+        """Drain queued jobs, stop threads. Returns True if all threads exited."""
+        with self._cond:
+            self._stop = True
+            self._cond.notify_all()
+        for t in self._threads:
+            t.join(timeout=timeout)
+        return not any(t.is_alive() for t in self._threads)
+
+
+@dataclass
+class _Batch:
+    """One launch_copy call; completes once all its runs are done."""
+
+    event_idx: int
+    events_list: list[tuple[int, torch.Event]]
+    remaining: int = 0
+    sealed: bool = False  # all runs dispatched; remaining is final
+    failed: bool = False
+
+
+class DiskBackend:
+    """Async disk offload backend: parallel coalesced IO + pipelined DMA."""
 
     def __init__(self) -> None:
         self._store_params: BatchMemcpyParams | None = None
@@ -67,6 +293,9 @@ class DiskBackend:
         self._load_queue: queue.SimpleQueue = queue.SimpleQueue()
         self._store_thread: threading.Thread | None = None
         self._load_thread: threading.Thread | None = None
+        self._io_pool: _IOPool | None = None
+        self._load_slots: _SlotPool | None = None
+        self._store_slots: _SlotPool | None = None
         self._shutdown: bool = False
         self._fd: int = -1
         self._disk_path: str = ""
@@ -77,6 +306,13 @@ class DiskBackend:
         self._load_slot_views: list[list[memoryview]] = []
         self._per_tensor_bpb: list[int] = []
         self._tensor_names: list[str] = []
+        self._max_run_blocks: int = 1
+        # In-order completion bookkeeping.
+        self._order_lock = threading.Condition()
+        self._load_batches: deque[_Batch] = deque()
+        self._store_batches: deque[_Batch] = deque()
+        self._num_outstanding = 0  # launched, event not yet appended
+        self._error: BaseException | None = None
 
     def init(
         self,
@@ -87,12 +323,17 @@ class DiskBackend:
         disk_path: str,
         num_disk_slots: int,
         total_block_bytes: int,
-        num_buffer_slots: int = 2,
+        num_buffer_slots: int = DEFAULT_DISK_BUFFER_SLOTS,
         use_page_cache: bool = False,
+        num_io_threads: int = DEFAULT_DISK_IO_THREADS,
+        max_coalesce_blocks: int = DEFAULT_DISK_MAX_COALESCE_BLOCKS,
+        max_store_io_threads: int | None = None,
     ) -> None:
         self._load_stream = load_stream
         self._store_stream = store_stream
         self._total_block_bytes = total_block_bytes
+        num_buffer_slots = max(1, int(num_buffer_slots))
+        num_io_threads = max(1, int(num_io_threads))
         self._num_buffer_slots = num_buffer_slots
         self._tensor_names = list(gpu_caches.keys())
         self._per_tensor_bpb = [
@@ -106,7 +347,19 @@ class DiskBackend:
                 f"total_block_bytes={total_block_bytes} not aligned to {_ALIGNMENT}"
             )
 
-        # Separate buffer pools for store and load threads
+        # A run must fit in one syscall (IOV_MAX iovecs) and in the staging
+        # ring; keep at least two runs' worth of slots so IO and DMA overlap.
+        iov_cap = max(1, _IOV_MAX // max(1, len(self._tensor_names)))
+        self._max_run_blocks = max(
+            1,
+            min(
+                int(max_coalesce_blocks),
+                iov_cap,
+                max(1, num_buffer_slots // 2),
+            ),
+        )
+
+        # Separate buffer pools for stores and loads.
         self._store_buffer_caches = {}
         self._load_buffer_caches = {}
         for name, gpu_t in gpu_caches.items():
@@ -162,29 +415,46 @@ class DiskBackend:
         self._disk_path = disk_path
         os.ftruncate(self._fd, num_disk_slots * total_block_bytes)
 
+        if max_store_io_threads is None:
+            max_store_io_threads = max(1, num_io_threads // 2)
+        max_store_io_threads = max(1, min(int(max_store_io_threads), num_io_threads))
+
         logger.info(
-            "DiskBackend: path=%s, slots=%d, total=%.2f GB, buf=%dx%d bytes"
-            " (page_cache=%s)",
+            "DiskBackend: path=%s, slots=%d, total=%.2f GB, staging=%d slots x "
+            "%d bytes per direction (%.2f GB pinned), io_threads=%d "
+            "(store<=%d), max_coalesce=%d blocks, page_cache=%s",
             disk_path,
             num_disk_slots,
             (num_disk_slots * total_block_bytes) / (1024**3),
             num_buffer_slots,
             total_block_bytes,
+            2 * num_buffer_slots * total_block_bytes / (1024**3),
+            num_io_threads,
+            max_store_io_threads,
+            self._max_run_blocks,
             use_page_cache,
         )
+
+        self._load_slots = _SlotPool(num_buffer_slots)
+        self._store_slots = _SlotPool(num_buffer_slots)
+        self._io_pool = _IOPool(num_io_threads, max_store_io_threads, device)
 
         self._store_thread = threading.Thread(
             target=self._store_loop,
             args=(device, store_stream),
+            name="kv-disk-store",
             daemon=True,
         )
         self._load_thread = threading.Thread(
             target=self._load_loop,
             args=(device, load_stream),
+            name="kv-disk-load",
             daemon=True,
         )
         self._store_thread.start()
         self._load_thread.start()
+
+    # ------------------------------------------------------------------ API
 
     def launch_copy(
         self,
@@ -195,8 +465,25 @@ class DiskBackend:
         events_list: list[tuple[int, torch.Event]],
         wait_event: torch.Event | None = None,
     ) -> None:
+        if self._error is not None:
+            raise RuntimeError("DiskBackend IO failed earlier") from self._error
+        assert len(src_blocks) == len(dst_blocks)
+        with self._order_lock:
+            self._num_outstanding += 1
         q = self._store_queue if is_store else self._load_queue
         q.put((src_blocks, dst_blocks, event_idx, events_list, wait_event))
+
+    def flush(self, timeout: float | None = None) -> bool:
+        """Block until every launched batch has appended its event.
+
+        Returns False on timeout or if a batch failed.
+        """
+        with self._order_lock:
+            ok = self._order_lock.wait_for(
+                lambda: self._num_outstanding == 0 or self._error is not None,
+                timeout=timeout,
+            )
+            return ok and self._error is None
 
     def shutdown(self) -> None:
         if self._shutdown:
@@ -208,6 +495,12 @@ class DiskBackend:
             self._store_thread.join(timeout=10.0)
         if self._load_thread is not None:
             self._load_thread.join(timeout=10.0)
+        io_done = True
+        if self._io_pool is not None:
+            io_done = self._io_pool.shutdown(timeout=10.0)
+        for pool in (self._load_slots, self._store_slots):
+            if pool is not None:
+                pool.close()
         if self._fd < 0:
             return
         # Slot contents can encode user prompts, so drop the name now rather
@@ -221,7 +514,7 @@ class DiskBackend:
         # reused by an unrelated open(), turning its next pwritev into a write
         # into that file. Leaking one fd for the remaining process lifetime is
         # the cheaper failure.
-        if any(
+        if not io_done or any(
             t is not None and t.is_alive()
             for t in (self._store_thread, self._load_thread)
         ):
@@ -233,111 +526,203 @@ class DiskBackend:
         os.close(self._fd)
         self._fd = -1
 
-    def _store_loop(
-        self,
-        device: torch.device,
-        stream: torch.cuda.Stream,
-    ) -> None:
+    # ------------------------------------------------------- completion order
+
+    def _register_batch(
+        self, is_store: bool, event_idx: int, events_list: list
+    ) -> _Batch:
+        batch = _Batch(event_idx=event_idx, events_list=events_list)
+        with self._order_lock:
+            (self._store_batches if is_store else self._load_batches).append(batch)
+        return batch
+
+    def _run_done(self, batch: _Batch, is_store: bool, ok: bool) -> None:
+        with self._order_lock:
+            batch.remaining -= 1
+            if not ok:
+                batch.failed = True
+            self._drain_locked(is_store)
+
+    def _seal(self, batch: _Batch, is_store: bool) -> None:
+        # ``failed`` may have been set by this coordinator without the lock;
+        # it is published here together with ``sealed``.
+        with self._order_lock:
+            batch.sealed = True
+            self._drain_locked(is_store)
+
+    def _drain_locked(self, is_store: bool) -> None:
+        """Append events for the done prefix of the batch queue, in order."""
+        batches = self._store_batches if is_store else self._load_batches
+        stream = self._store_stream if is_store else self._load_stream
+        appended = False
+        while batches:
+            b = batches[0]
+            if not b.sealed or b.remaining > 0 or b.failed:
+                # A failed batch never completes: reporting it would publish
+                # garbage (store) or hand garbage KV to a request (load).
+                break
+            batches.popleft()
+            # Loads: recorded after every DMA of this batch was issued on the
+            # load stream, so the event fires once the KV is on the GPU.
+            # Stores: the data is already on disk; the event is just a marker.
+            b.events_list.append((b.event_idx, _record_event(stream)))
+            self._num_outstanding -= 1
+            appended = True
+        if appended:
+            self._order_lock.notify_all()
+
+    def _fail(self, exc: BaseException) -> None:
+        logger.exception("DiskBackend IO failure", exc_info=exc)
+        with self._order_lock:
+            if self._error is None:
+                self._error = exc
+            self._order_lock.notify_all()
+
+    # ------------------------------------------------------------- loads
+
+    def _load_loop(self, device: torch.device, stream: torch.cuda.Stream) -> None:
         current_platform.set_device(device)
-        while True:
-            item = self._store_queue.get()
-            if item is None:
-                return
-            (src_blocks, dst_blocks, event_idx, events_list, wait_event) = item
-            if wait_event is not None:
-                stream.wait_event(wait_event)
-            self._do_store(src_blocks, dst_blocks, stream)
-            event = torch.Event()
-            event.record(stream)
-            events_list.append((event_idx, event))
-
-    def _writev_slot(self, buf_slot: int, file_offset: int) -> None:
-        written = os.pwritev(self._fd, self._store_slot_views[buf_slot], file_offset)
-        if written < self._total_block_bytes:
-            raise OSError(
-                f"Short write: expected {self._total_block_bytes} bytes, "
-                f"wrote {written}"
-            )
-
-    def _readv_slot(self, buf_slot: int, file_offset: int) -> None:
-        bytes_read = os.preadv(self._fd, self._load_slot_views[buf_slot], file_offset)
-        if bytes_read < self._total_block_bytes:
-            raise OSError(
-                f"Short read: expected {self._total_block_bytes} bytes, "
-                f"read {bytes_read}"
-            )
-
-    def _load_loop(
-        self,
-        device: torch.device,
-        stream: torch.cuda.Stream,
-    ) -> None:
-        current_platform.set_device(device)
+        assert self._load_slots is not None and self._io_pool is not None
         while True:
             item = self._load_queue.get()
             if item is None:
                 return
-            (src_blocks, dst_blocks, event_idx, events_list, wait_event) = item
+            disk_slots, gpu_blocks, event_idx, events_list, wait_event = item
+            batch = self._register_batch(False, event_idx, events_list)
             if wait_event is not None:
                 stream.wait_event(wait_event)
-            self._do_load(src_blocks, dst_blocks, stream)
-            event = torch.Event()
-            event.record(stream)
-            events_list.append((event_idx, event))
+            try:
+                for run in _split_runs(
+                    list(zip(disk_slots, gpu_blocks)), self._max_run_blocks
+                ):
+                    slots = self._load_slots.acquire(len(run))
+                    with self._order_lock:
+                        batch.remaining += 1
+                    self._io_pool.submit(
+                        functools.partial(self._load_run, batch, run, slots, stream),
+                        is_store=False,
+                    )
+            except _BackendShutdown:
+                return
+            except Exception as e:  # noqa: BLE001
+                self._fail(e)
+                batch.failed = True
+            self._seal(batch, False)
 
-    def _do_store(
+    def _load_run(
         self,
-        gpu_blocks: list[int],
-        disk_slots: list[int],
+        batch: _Batch,
+        run: list[tuple[int, int]],
+        slots: list[int],
         stream: torch.cuda.Stream,
     ) -> None:
-        """GPU -> buffer (DMA) -> disk (pwritev), interleaved double-buffer."""
-        assert self._store_params is not None
-        n = self._num_buffer_slots
-        # (DMA event, file offset) of the block already staged in each slot.
-        pending: list[tuple[torch.Event, int] | None] = [None] * n
+        assert self._load_slots is not None and self._load_params is not None
+        ok = False
+        dma_issued = False
+        try:
+            views = [v for s in slots for v in self._load_slot_views[s]]
+            _rw_full(
+                os.preadv,
+                self._fd,
+                views,
+                run[0][0] * self._total_block_bytes,
+                "read",
+            )
+            copy_blocks(slots, [g for _, g in run], self._load_params)
+            dma_issued = True
+            self._load_slots.release_after(_record_event(stream), slots)
+            ok = True
+        except Exception as e:  # noqa: BLE001
+            self._fail(e)
+            if not dma_issued:
+                self._load_slots.release(slots)
+        finally:
+            self._run_done(batch, False, ok)
 
-        for i, (gpu_blk, disk_slot) in enumerate(zip(gpu_blocks, disk_slots)):
-            buf_slot = i % n
-            prev = pending[buf_slot]
-            if prev is not None:
-                prev[0].synchronize()
-                self._writev_slot(buf_slot, prev[1])
+    # ------------------------------------------------------------- stores
 
-            copy_blocks([gpu_blk], [buf_slot], self._store_params)
-            ev = torch.Event()
-            ev.record(stream)
-            pending[buf_slot] = (ev, disk_slot * self._total_block_bytes)
+    def _store_loop(self, device: torch.device, stream: torch.cuda.Stream) -> None:
+        current_platform.set_device(device)
+        assert self._store_slots is not None and self._io_pool is not None
+        while True:
+            item = self._store_queue.get()
+            if item is None:
+                return
+            gpu_blocks, disk_slots, event_idx, events_list, wait_event = item
+            batch = self._register_batch(True, event_idx, events_list)
+            if wait_event is not None:
+                stream.wait_event(wait_event)
+            # (dma_event, run, slots) staged on GPU->host but not yet written.
+            staged: deque[tuple[torch.Event, list[tuple[int, int]], list[int]]] = (
+                deque()
+            )
+            try:
+                for run in _split_runs(
+                    list(zip(disk_slots, gpu_blocks)), self._max_run_blocks
+                ):
+                    slots = self._acquire_store_slots(len(run), staged, batch)
+                    copy_blocks([g for _, g in run], slots, self._store_params)
+                    staged.append((_record_event(stream), run, slots))
+                    with self._order_lock:
+                        batch.remaining += 1
+                    # Hand off whatever DMA already finished, without blocking.
+                    while staged and staged[0][0].query():
+                        self._submit_store(batch, *staged.popleft()[1:])
+                while staged:
+                    ev, run, slots = staged.popleft()
+                    ev.synchronize()
+                    self._submit_store(batch, run, slots)
+            except _BackendShutdown:
+                return
+            except Exception as e:  # noqa: BLE001
+                self._fail(e)
+                batch.failed = True
+            self._seal(batch, True)
 
-        for slot, last in enumerate(pending):
-            if last is not None:
-                last[0].synchronize()
-                self._writev_slot(slot, last[1])
-
-    def _do_load(
+    def _acquire_store_slots(
         self,
-        disk_slots: list[int],
-        gpu_blocks: list[int],
-        stream: torch.cuda.Stream,
+        k: int,
+        staged: deque[tuple[torch.Event, list[tuple[int, int]], list[int]]],
+        batch: _Batch,
+    ) -> list[int]:
+        assert self._store_slots is not None
+        while True:
+            slots = self._store_slots.try_acquire(k)
+            if slots is not None:
+                return slots
+            if not staged:
+                # Everything we own is being written; wait for a write.
+                return self._store_slots.acquire(k)
+            # Free up slots by pushing the oldest staged run to disk.
+            ev, run, s = staged.popleft()
+            ev.synchronize()
+            self._submit_store(batch, run, s)
+
+    def _submit_store(
+        self, batch: _Batch, run: list[tuple[int, int]], slots: list[int]
     ) -> None:
-        """Disk (preadv) -> buffer -> GPU (DMA), interleaved double-buffer."""
-        assert self._load_params is not None
-        n = self._num_buffer_slots
-        prev_dma_events: list[torch.Event | None] = [None] * n
+        assert self._io_pool is not None
+        self._io_pool.submit(
+            functools.partial(self._store_run, batch, run, slots), is_store=True
+        )
 
-        for i, (disk_slot, gpu_blk) in enumerate(zip(disk_slots, gpu_blocks)):
-            buf_slot = i % n
-            prev = prev_dma_events[buf_slot]
-            if prev is not None:
-                prev.synchronize()
-
-            self._readv_slot(buf_slot, disk_slot * self._total_block_bytes)
-
-            copy_blocks([buf_slot], [gpu_blk], self._load_params)
-            ev = torch.Event()
-            ev.record(stream)
-            prev_dma_events[buf_slot] = ev
-
-        for ev in prev_dma_events:
-            if ev is not None:
-                ev.synchronize()
+    def _store_run(
+        self, batch: _Batch, run: list[tuple[int, int]], slots: list[int]
+    ) -> None:
+        assert self._store_slots is not None
+        ok = False
+        try:
+            views = [v for s in slots for v in self._store_slot_views[s]]
+            _rw_full(
+                os.pwritev,
+                self._fd,
+                views,
+                run[0][0] * self._total_block_bytes,
+                "write",
+            )
+            ok = True
+        except Exception as e:  # noqa: BLE001
+            self._fail(e)
+        finally:
+            self._store_slots.release(slots)
+            self._run_done(batch, True, ok)
