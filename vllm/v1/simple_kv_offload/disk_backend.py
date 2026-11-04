@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import mmap
 import os
 import queue
 import threading
@@ -50,6 +51,7 @@ from vllm.v1.simple_kv_offload.cuda_mem_ops import (
     build_params,
     copy_blocks,
     pin_tensor,
+    unpin_tensor,
 )
 
 logger = init_logger(__name__)
@@ -58,8 +60,10 @@ O_DIRECT = getattr(os, "O_DIRECT", 0)
 _ALIGNMENT = 4096
 
 # Defaults, overridable through kv_connector_extra_config.
-DEFAULT_DISK_IO_THREADS = 16
-DEFAULT_DISK_BUFFER_SLOTS = 32
+# Measured on GB300 (4x NVMe RAID0): loads reach the fio ceiling with fewer
+# than 4 IO threads per rank, so keep pinned staging modest.
+DEFAULT_DISK_IO_THREADS = 8
+DEFAULT_DISK_BUFFER_SLOTS = 16
 DEFAULT_DISK_MAX_COALESCE_BLOCKS = 4
 # Scheduler side: LRU window searched for consecutive free disk slots.
 DEFAULT_DISK_ALLOC_WINDOW_BLOCKS = 256
@@ -76,17 +80,58 @@ def _iov_max() -> int:
 _IOV_MAX = _iov_max()
 
 
-def _alloc_aligned(num_slots: int, bpb: int) -> torch.Tensor:
-    """Allocate a staging buffer whose base address is O_DIRECT aligned.
+def _page_size() -> int:
+    """Host page size, at least the O_DIRECT alignment (64 KiB on some arm64)."""
+    try:
+        page = os.sysconf("SC_PAGE_SIZE")
+    except (AttributeError, ValueError, OSError):
+        page = mmap.PAGESIZE
+    return max(_ALIGNMENT, int(page))
 
-    The CPU allocator only guarantees 64-byte alignment, so over-allocate by
-    one alignment unit and return an aligned view. The view keeps the backing
-    storage alive.
+
+def _round_up(x: int, align: int) -> int:
+    return (x + align - 1) // align * align
+
+
+class StagingRegion:
+    """Pinned host staging for one direction: one page-aligned region.
+
+    All tensors' ``[num_slots, bpb]`` buffers live in a single anonymous mmap,
+    aligned to and padded to whole host pages, and registered with
+    cudaHostRegister exactly once. cudaHostRegister works on whole pages, so
+    buffers carved from the malloc heap can share a page with another
+    registration (or with a still-registered buffer from an earlier init) and
+    fail with cudaErrorHostMemoryAlreadyRegistered on 64 KiB-page kernels.
     """
-    nbytes = num_slots * bpb
-    raw = torch.zeros(nbytes + _ALIGNMENT, dtype=torch.int8, device="cpu")
-    offset = -raw.data_ptr() % _ALIGNMENT
-    return raw[offset : offset + nbytes].view(num_slots, bpb)
+
+    def __init__(self, num_slots: int, bpbs: list[int]) -> None:
+        page = _page_size()
+        offsets = []
+        off = 0
+        for bpb in bpbs:
+            offsets.append(off)
+            off = _round_up(off + num_slots * bpb, _ALIGNMENT)
+        self.nbytes = _round_up(max(off, 1), page)
+        # Over-allocate one page so the region can start on a page boundary
+        # even if the configured page size exceeds mmap's own alignment.
+        self._mmap = mmap.mmap(-1, self.nbytes + page)
+        full = torch.frombuffer(self._mmap, dtype=torch.int8)
+        shift = -full.data_ptr() % page
+        self.base = full[shift : shift + self.nbytes]
+        self.tensors = [
+            self.base[o : o + num_slots * bpb].view(num_slots, bpb)
+            for o, bpb in zip(offsets, bpbs)
+        ]
+        self.registered = False
+
+    def register(self) -> None:
+        pin_tensor(self.base)
+        self.registered = True
+
+    def unregister(self) -> None:
+        if self.registered:
+            unpin_tensor(self.base)
+            self.registered = False
 
 
 def _record_event(stream: torch.cuda.Stream) -> torch.Event:
@@ -210,6 +255,16 @@ class _SlotPool:
             self._closed = True
             self._cond.notify_all()
 
+    def drain(self) -> None:
+        """Wait for every deferred-release DMA event."""
+        while True:
+            with self._cond:
+                if not self._pending:
+                    return
+                ev, slots = self._pending.popleft()
+            ev.synchronize()
+            self.release(slots)
+
 
 class _IOPool:
     """IO thread pool with two priority classes (loads before stores)."""
@@ -304,6 +359,8 @@ class DiskBackend:
         self._fd: int = -1
         self._disk_path: str = ""
         self._total_block_bytes: int = 0
+        self._store_region: StagingRegion | None = None
+        self._load_region: StagingRegion | None = None
         self._store_buffer_caches: dict[str, torch.Tensor] = {}
         self._load_buffer_caches: dict[str, torch.Tensor] = {}
         self._store_slot_views: list[list[memoryview]] = []
@@ -366,17 +423,21 @@ class DiskBackend:
             ),
         )
 
-        # Separate buffer pools for stores and loads.
-        self._store_buffer_caches = {}
-        self._load_buffer_caches = {}
-        for name, gpu_t in gpu_caches.items():
-            bpb = gpu_t.stride(0) * gpu_t.element_size()
-            store_buf = _alloc_aligned(num_buffer_slots, bpb)
-            pin_tensor(store_buf)
-            self._store_buffer_caches[name] = store_buf
-            load_buf = _alloc_aligned(num_buffer_slots, bpb)
-            pin_tensor(load_buf)
-            self._load_buffer_caches[name] = load_buf
+        # Separate staging regions for stores and loads, one registration each.
+        self._store_region = StagingRegion(num_buffer_slots, self._per_tensor_bpb)
+        self._load_region = StagingRegion(num_buffer_slots, self._per_tensor_bpb)
+        self._store_region.register()
+        try:
+            self._load_region.register()
+        except BaseException:
+            self._store_region.unregister()
+            raise
+        self._store_buffer_caches = dict(
+            zip(self._tensor_names, self._store_region.tensors)
+        )
+        self._load_buffer_caches = dict(
+            zip(self._tensor_names, self._load_region.tensors)
+        )
 
         # Pre-built iovec views per slot (avoid per-transfer .numpy() calls)
         self._store_slot_views = [
@@ -508,6 +569,23 @@ class DiskBackend:
         for pool in (self._load_slots, self._store_slots):
             if pool is not None:
                 pool.close()
+        threads_done = io_done and not any(
+            t is not None and t.is_alive()
+            for t in (self._store_thread, self._load_thread)
+        )
+        if threads_done:
+            # Wait for in-flight H2D copies out of load staging, then release
+            # the registrations so a later init in this process can register.
+            if self._load_slots is not None:
+                self._load_slots.drain()
+            for region in (self._store_region, self._load_region):
+                if region is not None:
+                    try:
+                        region.unregister()
+                    except RuntimeError:
+                        logger.exception("Failed to unregister disk staging")
+        else:
+            logger.warning("IO thread still running; leaving staging registered")
         if self._fd < 0:
             return
         # Slot contents can encode user prompts, so drop the name now rather
@@ -521,10 +599,7 @@ class DiskBackend:
         # reused by an unrelated open(), turning its next pwritev into a write
         # into that file. Leaking one fd for the remaining process lifetime is
         # the cheaper failure.
-        if not io_done or any(
-            t is not None and t.is_alive()
-            for t in (self._store_thread, self._load_thread)
-        ):
+        if not threads_done:
             logger.warning(
                 "IO thread still running after shutdown timeout; leaking fd %d",
                 self._fd,
@@ -661,6 +736,7 @@ class DiskBackend:
     def _store_loop(self, device: torch.device, stream: torch.cuda.Stream) -> None:
         current_platform.set_device(device)
         assert self._store_slots is not None and self._io_pool is not None
+        assert self._store_params is not None
         while True:
             item = self._store_queue.get()
             if item is None:

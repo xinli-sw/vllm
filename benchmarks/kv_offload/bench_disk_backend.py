@@ -144,9 +144,8 @@ def _make_legacy_cls():
         CU_MEMCPY_SRC_ACCESS_ORDER_STREAM,
         build_params,
         copy_blocks,
-        pin_tensor,
     )
-    from vllm.v1.simple_kv_offload.disk_backend import _alloc_aligned
+    from vllm.v1.simple_kv_offload.disk_backend import StagingRegion
 
     class LegacyDiskBackend:
         def init(
@@ -165,14 +164,17 @@ def _make_legacy_cls():
             self._T = total_block_bytes
             self._n = num_buffer_slots
             names = list(gpu_caches)
-            self._sbuf = {}
-            self._lbuf = {}
-            for name, g in gpu_caches.items():
-                bpb = g.stride(0) * g.element_size()
-                self._sbuf[name] = _alloc_aligned(num_buffer_slots, bpb)
-                pin_tensor(self._sbuf[name])
-                self._lbuf[name] = _alloc_aligned(num_buffer_slots, bpb)
-                pin_tensor(self._lbuf[name])
+            # Same page-aligned, unregistered-on-shutdown staging as the new
+            # backend; "legacy" here means the old IO pattern only.
+            bpbs = [g.stride(0) * g.element_size() for g in gpu_caches.values()]
+            self._regions = [
+                StagingRegion(num_buffer_slots, bpbs),
+                StagingRegion(num_buffer_slots, bpbs),
+            ]
+            for r in self._regions:
+                r.register()
+            self._sbuf = dict(zip(names, self._regions[0].tensors))
+            self._lbuf = dict(zip(names, self._regions[1].tensors))
             self._sviews = [
                 [memoryview(self._sbuf[n][s].numpy()) for n in names]
                 for s in range(num_buffer_slots)
@@ -230,6 +232,9 @@ def _make_legacy_cls():
             self._lq.put(None)
             for t in self._threads:
                 t.join(timeout=10)
+            torch.cuda.synchronize()
+            for r in self._regions:
+                r.unregister()
             with contextlib.suppress(OSError):
                 os.unlink(self._path)
             os.close(self._fd)
@@ -638,8 +643,8 @@ def main() -> None:
     p.add_argument("--backends", default="legacy,new", help="legacy,new or none")
     p.add_argument("--inflight", type=_ints, default=[1, 4, 16])
     p.add_argument("--batch-blocks", type=_ints, default=[8, 64])
-    p.add_argument("--io-threads", type=_ints, default=[16])
-    p.add_argument("--buffer-slots", type=_ints, default=[32])
+    p.add_argument("--io-threads", type=_ints, default=[4, 8])
+    p.add_argument("--buffer-slots", type=_ints, default=[16])
     p.add_argument("--coalesce", type=_ints, default=[1, 4])
     p.add_argument("--layouts", default="random,contiguous")
     p.add_argument("--use-page-cache", action="store_true")

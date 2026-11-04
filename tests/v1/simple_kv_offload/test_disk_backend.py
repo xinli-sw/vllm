@@ -36,6 +36,7 @@ class _FakeStream:
 @pytest.fixture
 def fake_cuda(monkeypatch):
     monkeypatch.setattr(db, "pin_tensor", lambda t: None)
+    monkeypatch.setattr(db, "unpin_tensor", lambda t: None)
     monkeypatch.setattr(db, "build_params", lambda src, dst, stream, **kw: (src, dst))
 
     def _copy(src_ids, dst_ids, params):
@@ -433,3 +434,79 @@ def test_loads_complete_out_of_order(tmp_path, fake_cuda, monkeypatch):
     finally:
         gate.set()
         backend.shutdown()
+
+
+class _FakeHostRegistry:
+    """Models cudaHostRegister on whole pages: overlapping or repeated
+    registrations fail like cudaErrorHostMemoryAlreadyRegistered."""
+
+    def __init__(self, page: int) -> None:
+        self.page = page
+        self.pages: dict[int, int] = {}  # page index -> registration base
+        self.ranges: dict[int, int] = {}  # base -> nbytes
+        self.registers = 0
+        self.unregisters = 0
+
+    def _span(self, ptr: int, nbytes: int) -> range:
+        return range(ptr // self.page, (ptr + nbytes - 1) // self.page + 1)
+
+    def pin(self, t: torch.Tensor) -> None:
+        ptr, nbytes = t.data_ptr(), t.nbytes
+        span = self._span(ptr, nbytes)
+        if any(p in self.pages for p in span):
+            raise RuntimeError("cudaHostRegister failed: already registered")
+        for p in span:
+            self.pages[p] = ptr
+        self.ranges[ptr] = nbytes
+        self.registers += 1
+
+    def unpin(self, t: torch.Tensor) -> None:
+        ptr = t.data_ptr()
+        nbytes = self.ranges.pop(ptr)
+        for p in self._span(ptr, nbytes):
+            del self.pages[p]
+        self.unregisters += 1
+
+
+def test_staging_is_page_aligned_and_reinit_works(tmp_path, fake_cuda, monkeypatch):
+    """64 KiB pages: staging regions are page aligned/padded, registered once per
+    direction, unregistered on shutdown, so init->shutdown->init succeeds."""
+    page = 64 * 1024
+    reg = _FakeHostRegistry(page)
+    monkeypatch.setattr(db, "_page_size", lambda: page)
+    monkeypatch.setattr(db, "pin_tensor", reg.pin)
+    monkeypatch.setattr(db, "unpin_tensor", reg.unpin)
+
+    # Odd sizes so per-tensor buffers do not end on page boundaries.
+    tensor_bytes = (4096 * 3, 4096 * 5)
+    for _ in range(3):
+        backend, gpu = _make_backend(
+            tmp_path, tensor_bytes=tensor_bytes, num_buffer_slots=3
+        )
+        try:
+            assert reg.registers - reg.unregisters == 2
+            for region in (backend._store_region, backend._load_region):
+                assert region.base.data_ptr() % page == 0
+                assert region.nbytes % page == 0
+                for t in region.tensors:
+                    assert t.data_ptr() % 4096 == 0
+                    assert region.base.data_ptr() <= t.data_ptr()
+                    assert (
+                        t.data_ptr() + t.nbytes
+                        <= region.base.data_ptr() + region.nbytes
+                    )
+            # The data path still round-trips through the new staging.
+            _fill(gpu, range(4), seed=7)
+            expected = {n: t[:4].clone() for n, t in gpu.items()}
+            ev: list = []
+            backend.launch_copy([0, 1, 2, 3], [9, 3, 4, 5], True, 0, ev)
+            _wait(ev, 1)
+            ev = []
+            backend.launch_copy([9, 3, 4, 5], [10, 11, 12, 13], False, 0, ev)
+            _wait(ev, 1)
+            for n, t in gpu.items():
+                assert torch.equal(t[10:14], expected[n])
+        finally:
+            backend.shutdown()
+        assert reg.registers == reg.unregisters
+        assert not reg.pages
