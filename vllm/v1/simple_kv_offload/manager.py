@@ -596,28 +596,31 @@ class SimpleCPUOffloadScheduler:
                         store_state.store_events.add(store_event)
 
         # --- Loads ---
+        # One event per request so each request is reported as soon as its own
+        # blocks land, instead of waiting for the slowest block of the step.
         load_event = -1
         load_gpu: list[int] = []
         load_cpu: list[int] = []
-        load_req_ids: list[str] = []
+        load_splits: list[tuple[int, int]] = []
         for req_id, load_state in self._reqs_to_load.items():
             if load_state.load_event is not None:
                 continue
             assert load_state.transfer_meta is not None
+            event_idx = self._load_event_counter
+            self._load_event_counter += 1
+            if load_event < 0:
+                load_event = event_idx
             load_gpu.extend(load_state.transfer_meta.gpu_block_ids)
             load_cpu.extend(load_state.transfer_meta.cpu_block_ids)
-            load_req_ids.append(req_id)
-        if load_req_ids:
-            load_event = self._load_event_counter
-            self._load_event_counter += 1
-            for req_id in load_req_ids:
-                self._reqs_to_load[req_id].load_event = load_event
-            self._load_event_to_reqs[load_event] = load_req_ids
+            load_splits.append((event_idx, len(load_state.transfer_meta.cpu_block_ids)))
+            load_state.load_event = event_idx
+            self._load_event_to_reqs[event_idx] = [req_id]
 
         result = SimpleCPUOffloadMetadata(
             load_event=load_event,
             load_gpu_blocks=load_gpu,
             load_cpu_blocks=load_cpu,
+            load_event_splits=load_splits,
             load_event_to_reqs={
                 event_idx: list(req_ids)
                 for event_idx, req_ids in self._load_event_to_reqs.items()

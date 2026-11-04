@@ -331,7 +331,7 @@ def _run_phase(backend, batches, is_store, inflight, stream):
     events: list = []
     launch_t: list[float] = []
     lat: list[float] = []
-    done = 0
+    done = 0  # completed batches (loads may complete out of order)
     wait_event = None
     if is_store:
         wait_event = torch.Event()
@@ -346,9 +346,10 @@ def _run_phase(backend, batches, is_store, inflight, stream):
             nxt += 1
         if len(events) > done:
             idx, ev = events[done]
-            assert idx == done, f"out-of-order completion {idx} != {done}"
+            if is_store:
+                assert idx == done, f"out-of-order store {idx} != {done}"
             ev.synchronize()
-            lat.append(time.perf_counter() - launch_t[done])
+            lat.append(time.perf_counter() - launch_t[idx])
             done += 1
         else:
             time.sleep(0.0002)

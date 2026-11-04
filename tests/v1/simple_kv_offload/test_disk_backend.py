@@ -123,7 +123,8 @@ def test_round_trip(tmp_path, fake_cuda, coalesce, threads):
 
 
 def test_events_in_order_under_random_latency(tmp_path, fake_cuda, monkeypatch):
-    """Later batches may finish IO first but must be reported after earlier ones."""
+    """With ordered_load_completion, later batches may finish IO first but are
+    reported after earlier ones."""
     real_preadv = os.preadv
     rng = random.Random(0)
     lock = threading.Lock()
@@ -135,7 +136,11 @@ def test_events_in_order_under_random_latency(tmp_path, fake_cuda, monkeypatch):
         return real_preadv(fd, bufs, off)
 
     backend, gpu = _make_backend(
-        tmp_path, num_io_threads=8, num_buffer_slots=16, max_coalesce_blocks=2
+        tmp_path,
+        num_io_threads=8,
+        num_buffer_slots=16,
+        max_coalesce_blocks=2,
+        ordered_load_completion=True,
     )
     try:
         src = list(range(64))
@@ -388,4 +393,43 @@ def test_empty_batch_completes(tmp_path, fake_cuda):
         backend.launch_copy([], [], True, 0, events)
         _wait(events, 2)
     finally:
+        backend.shutdown()
+
+
+def test_loads_complete_out_of_order(tmp_path, fake_cuda, monkeypatch):
+    """Default: a small load is reported while an earlier big one is stuck."""
+    real_preadv = os.preadv
+    gate = threading.Event()
+    slow_off = 0  # disk slot 0 belongs to the first (big) batch
+
+    def gated_preadv(fd, bufs, off):
+        if off == slow_off:
+            gate.wait(10)
+        return real_preadv(fd, bufs, off)
+
+    backend, gpu = _make_backend(
+        tmp_path, num_io_threads=4, num_buffer_slots=8, max_coalesce_blocks=1
+    )
+    try:
+        _fill(gpu, range(8), seed=3)
+        expected = {n: t[:8].clone() for n, t in gpu.items()}
+        st: list = []
+        backend.launch_copy(list(range(8)), list(range(8)), True, 0, st)
+        _wait(st, 1)
+        for t in gpu.values():
+            t.zero_()
+        monkeypatch.setattr(os, "preadv", gated_preadv)
+        events: list = []
+        backend.launch_copy([0, 1, 2], [0, 1, 2], False, 0, events)
+        backend.launch_copy([5], [5], False, 1, events)
+        _wait(events, 1)
+        assert [i for i, _ in events] == [1]
+        gate.set()
+        _wait(events, 2)
+        assert [i for i, _ in events] == [1, 0]
+        for n, t in gpu.items():
+            for b in (0, 1, 2, 5):
+                assert torch.equal(t[b], expected[n][b])
+    finally:
+        gate.set()
         backend.shutdown()

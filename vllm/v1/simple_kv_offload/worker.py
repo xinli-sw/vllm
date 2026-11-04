@@ -76,7 +76,12 @@ class SimpleCPUOffloadWorker:
         self._store_events: list[tuple[int, torch.Event]] = []
         # High-water marks: highest event_idx completed per stream.
         # When the event list is empty, the hwm covers all prior events.
-        self._load_hwm: int = -1
+        # Loads complete per request and may finish out of order (disk), so
+        # they are tracked as a set of completed event indices, not a HWM.
+        self._done_load_events: set[int] = set()
+        # Launched load event_idx -> all event indices its copy covers (when
+        # several per-request events share one copy, e.g. CPU mode).
+        self._load_event_cover: dict[int, list[int]] = {}
         self._store_hwm: int = -1
 
         # Metadata for the current step
@@ -275,8 +280,8 @@ class SimpleCPUOffloadWorker:
 
     def bind_connector_metadata(self, metadata: SimpleCPUOffloadMetadata) -> None:
         self._connector_metadata = metadata
-        if metadata.load_event >= 0:
-            self._pending_load_event_indices.add(metadata.load_event)
+        for event_idx, _, _ in metadata.iter_load_splits():
+            self._pending_load_event_indices.add(event_idx)
         if metadata.store_event >= 0:
             self._pending_store_event_indices.add(metadata.store_event)
 
@@ -289,16 +294,39 @@ class SimpleCPUOffloadWorker:
         # op overhead (~5ms) stays hidden behind GPU compute. Stores are
         # issued in wait_for_save().
         metadata = self._connector_metadata
-        if metadata is not None and metadata.load_cpu_blocks:
-            backend = self._backend
-            assert backend is not None
-            backend.launch_copy(
-                metadata.load_cpu_blocks,
-                metadata.load_gpu_blocks,
-                is_store=False,
-                event_idx=metadata.load_event,
-                events_list=self._load_events,
-            )
+        if metadata is None:
+            return
+        splits = metadata.iter_load_splits()
+        if not splits:
+            return
+        backend = self._backend
+        assert backend is not None
+        cpu_blocks = metadata.load_cpu_blocks
+        gpu_blocks = metadata.load_gpu_blocks
+        if self.disk_mode:
+            # Disk: one batch per request, so each request is reported as
+            # soon as its own blocks land (the backend runs them in parallel).
+            for event_idx, start, end in splits:
+                backend.launch_copy(
+                    cpu_blocks[start:end],
+                    gpu_blocks[start:end],
+                    is_store=False,
+                    event_idx=event_idx,
+                    events_list=self._load_events,
+                )
+            return
+        # CPU DMA is fast and per-call overhead dominates: one copy for the
+        # whole step, whose event completes every request in it.
+        last_idx = splits[-1][0]
+        if len(splits) > 1:
+            self._load_event_cover[last_idx] = [e for e, _, _ in splits]
+        backend.launch_copy(
+            cpu_blocks,
+            gpu_blocks,
+            is_store=False,
+            event_idx=last_idx,
+            events_list=self._load_events,
+        )
 
     def wait_for_save(self) -> None:
         """Submit async stores.
@@ -341,9 +369,11 @@ class SimpleCPUOffloadWorker:
         finished_recving: set[str] = set()
 
         if self._pending_load_event_indices:
-            load_wm = self._poll_stream_events(is_store=False)
-            for j in [j for j in self._pending_load_event_indices if j <= load_wm]:
+            self._poll_load_events()
+            done = self._done_load_events
+            for j in [j for j in self._pending_load_event_indices if j in done]:
                 self._pending_load_event_indices.discard(j)
+                done.discard(j)
                 req_ids = (
                     metadata.load_event_to_reqs.get(j) if metadata is not None else None
                 )
@@ -390,28 +420,52 @@ class SimpleCPUOffloadWorker:
                 "SimpleCPUOffloadWorker: offload backend flush failed; "
                 "some transfers did not complete"
             )
-        for event_idx, event in self._load_events:
+        n = len(self._load_events)
+        for event_idx, event in self._load_events[:n]:
             event.synchronize()
-            self._load_hwm = event_idx
-        self._load_events.clear()
+            self._mark_load_done(event_idx)
+        del self._load_events[:n]
 
         for event_idx, event in self._store_events:
             event.synchronize()
             self._store_hwm = event_idx
         self._store_events.clear()
 
+    def _mark_load_done(self, event_idx: int) -> None:
+        covered = self._load_event_cover.pop(event_idx, None)
+        if covered is None:
+            self._done_load_events.add(event_idx)
+        else:
+            self._done_load_events.update(covered)
+
+    def _poll_load_events(self) -> None:
+        """Non-blocking poll of every outstanding load event.
+
+        Unlike stores, loads are not required to complete in launch order.
+        """
+        # Backend threads append concurrently: only touch the first n entries
+        # and delete by index (back to front) so appends are never lost.
+        events = self._load_events
+        n = len(events)
+        for i in range(n - 1, -1, -1):
+            event_idx, event = events[i]
+            if event.query():
+                self._mark_load_done(event_idx)
+                del events[i]
+
     def _poll_stream_events(self, is_store: bool) -> int:
-        """Non-blocking poll for completed events and return the high-water mark."""
-        events = self._store_events if is_store else self._load_events
-        hwm = self._store_hwm if is_store else self._load_hwm
+        """Non-blocking poll of store events; returns the high-water mark.
+
+        Stores complete in launch order, so a prefix scan suffices.
+        """
+        assert is_store
+        events = self._store_events
+        hwm = self._store_hwm
         while events:
             event_idx, event = events[0]
             if not event.query():
                 break
             hwm = event_idx
             events.pop(0)
-        if is_store:
-            self._store_hwm = hwm
-        else:
-            self._load_hwm = hwm
+        self._store_hwm = hwm
         return hwm

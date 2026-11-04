@@ -854,7 +854,8 @@ def test_disk_backend_gpu_round_trip_many_batches(tmp_path, use_page_cache: bool
                 disk[sl], list(range(num_blocks))[sl], False, idx, load_events
             )
         assert backend.flush(timeout=60.0)
-        assert [i for i, _ in load_events] == list(range(16))
+        # Loads may complete out of order; each is reported exactly once.
+        assert sorted(i for i, _ in load_events) == list(range(16))
         for _, ev in load_events:
             ev.synchronize()
         for n, t in gpu.items():

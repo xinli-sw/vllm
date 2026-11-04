@@ -3814,3 +3814,69 @@ def test_eager_store_matches_gpu_cacheable_prefix(
         scheduler.cpu_block_pool.blocks[bid].block_hash
         for bid in load_meta.load_cpu_blocks
     ] == target_hashes + draft_hashes
+
+
+def test_loads_in_one_step_get_per_request_events() -> None:
+    """Each request loading in the same step gets its own load event, so the
+    worker can report it as soon as its own blocks have landed."""
+    fix = make_scheduler(num_cpu_blocks=16, num_gpu_blocks=32, lazy=False)
+    sched = fix.scheduler
+    gpu_pool = fix.gpu_block_pool
+
+    # Store two distinct prompts to CPU.
+    sources = []
+    for i, n in enumerate((2, 3)):
+        req = make_request(num_blocks=n)
+        kv = _alloc_and_register(fix, req, n)
+        sched.update_state_after_alloc(req, kv, num_external_tokens=0)
+        meta = sched.build_connector_meta(
+            make_scheduler_output(
+                {req.request_id: n * BLOCK_SIZE},
+                new_reqs={req.request_id: kv.get_block_ids()},
+            )
+        )
+        simulate_store_completion(sched, meta.store_event)
+        sources.append((req, n))
+
+    # Both hit the CPU cache and start loading in the same step.
+    loaders = []
+    for i, (src, n) in enumerate(sources):
+        req = Request(
+            request_id=f"loader-{i}",
+            prompt_token_ids=src.prompt_token_ids,
+            sampling_params=src.sampling_params,
+            pooling_params=None,
+            mm_features=None,
+            block_hasher=src._block_hasher,
+        )
+        hit, is_async = sched.get_num_new_matched_tokens(req, num_computed_tokens=0)
+        assert hit and is_async
+        kv = KVCacheBlocks(blocks=(gpu_pool.get_new_blocks(n),))
+        sched.update_state_after_alloc(req, kv, num_external_tokens=hit)
+        loaders.append((req, kv))
+
+    meta = sched.build_connector_meta(
+        make_scheduler_output(
+            {req.request_id: 1 for req, _ in loaders},
+            new_reqs={req.request_id: kv.get_block_ids() for req, kv in loaders},
+        )
+    )
+    splits = meta.iter_load_splits()
+    assert len(splits) == 2
+    (e0, s0, t0), (e1, s1, t1) = splits
+    assert e0 == meta.load_event and e1 == e0 + 1
+    assert (s0, t0, s1) == (0, t0, t0) and t1 == len(meta.load_cpu_blocks)
+    assert meta.load_event_to_reqs == {e0: ["loader-0"], e1: ["loader-1"]}
+    # Each split covers exactly that request's blocks.
+    for (e, s, t), (req, _) in zip(splits, loaders):
+        tm = sched._reqs_to_load[req.request_id].transfer_meta
+        assert meta.load_cpu_blocks[s:t] == tm.cpu_block_ids
+        assert meta.load_gpu_blocks[s:t] == tm.gpu_block_ids
+        assert sched._reqs_to_load[req.request_id].load_event == e
+
+    # Completing one request leaves the other's event intact.
+    simulate_load_completion(sched, {"loader-1"})
+    assert e1 not in sched._load_event_to_reqs
+    assert sched._load_event_to_reqs[e0] == ["loader-0"]
+    simulate_load_completion(sched, {"loader-0"})
+    assert not sched._load_event_to_reqs

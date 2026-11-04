@@ -21,10 +21,14 @@ class SimpleCPUOffloadMetadata(KVConnectorMetadata):
     (via inverse maps), so the worker never knows about request identities.
     """
 
-    # Load event per step. INVALID_JOB_ID means no blocks to load this step.
+    # First load event of this step. INVALID_JOB_ID means no blocks to load.
     load_event: int = INVALID_JOB_ID
     load_gpu_blocks: list[int] = field(default_factory=list)
     load_cpu_blocks: list[int] = field(default_factory=list)
+    # Per-request split of the flat load lists: consecutive (event_idx,
+    # num_blocks) entries, so each request completes on its own event. Empty
+    # means one event (load_event) covers all load blocks.
+    load_event_splits: list[tuple[int, int]] = field(default_factory=list)
     # Reverse map: load_event->req_ids, for tracking requests with finished load events
     load_event_to_reqs: dict[int, list[str]] = field(default_factory=dict)
 
@@ -35,6 +39,20 @@ class SimpleCPUOffloadMetadata(KVConnectorMetadata):
 
     # Whether any requests were preempted this step and need flush pending transfers.
     need_flush: bool = False
+
+    def iter_load_splits(self) -> list[tuple[int, int, int]]:
+        """Return (event_idx, start, end) slices of the flat load lists."""
+        if self.load_event_splits:
+            out = []
+            start = 0
+            for event_idx, n in self.load_event_splits:
+                out.append((event_idx, start, start + n))
+                start += n
+            assert start == len(self.load_cpu_blocks) == len(self.load_gpu_blocks)
+            return out
+        if self.load_event >= 0:
+            return [(self.load_event, 0, len(self.load_cpu_blocks))]
+        return []
 
 
 @dataclass

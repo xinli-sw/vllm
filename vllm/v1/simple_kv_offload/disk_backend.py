@@ -17,10 +17,12 @@ Data path (high queue depth):
 - Loads have priority over stores: IO threads always prefer queued load runs,
   and at most ``max_store_io`` threads may run stores at the same time, so
   stores can never occupy every thread. Stores use their own staging ring.
-- Batches are issued in parallel but *completed in order*: a batch's event is
-  appended to the worker's ``events_list`` only once it and every earlier
-  batch of the same direction are done, preserving the worker's in-order
-  high-water-mark logic.
+- Batches are issued in parallel. Store batches are *completed in order*: a
+  store's event is appended to ``events_list`` only once it and every earlier
+  store are done, preserving the worker's store high-water mark. Load batches
+  (one per request) are reported as soon as each is done; the worker tracks
+  loads as a set of completed events. ``ordered_load_completion=True``
+  restores strict ordering for loads.
 
 Same ``launch_copy`` interface as DmaCopyBackend so the worker can swap
 backends without changing calling code.
@@ -312,6 +314,7 @@ class DiskBackend:
         self._load_batches: deque[_Batch] = deque()
         self._store_batches: deque[_Batch] = deque()
         self._num_outstanding = 0  # launched, event not yet appended
+        self._ordered_load_completion = False
         self._error: BaseException | None = None
 
     def init(
@@ -328,7 +331,9 @@ class DiskBackend:
         num_io_threads: int = DEFAULT_DISK_IO_THREADS,
         max_coalesce_blocks: int = DEFAULT_DISK_MAX_COALESCE_BLOCKS,
         max_store_io_threads: int | None = None,
+        ordered_load_completion: bool = False,
     ) -> None:
+        self._ordered_load_completion = ordered_load_completion
         self._load_stream = load_stream
         self._store_stream = store_stream
         self._total_block_bytes = total_block_bytes
@@ -551,17 +556,27 @@ class DiskBackend:
             self._drain_locked(is_store)
 
     def _drain_locked(self, is_store: bool) -> None:
-        """Append events for the done prefix of the batch queue, in order."""
+        """Append events for finished batches.
+
+        Stores are reported strictly in launch order (the worker tracks them
+        with a high-water mark). Loads are reported as soon as each batch is
+        done unless ``ordered_load_completion`` was requested.
+        """
         batches = self._store_batches if is_store else self._load_batches
         stream = self._store_stream if is_store else self._load_stream
+        in_order = is_store or self._ordered_load_completion
         appended = False
-        while batches:
-            b = batches[0]
+        i = 0
+        while i < len(batches):
+            b = batches[i]
+            # A failed batch never completes: reporting it would publish
+            # garbage (store) or hand garbage KV to a request (load).
             if not b.sealed or b.remaining > 0 or b.failed:
-                # A failed batch never completes: reporting it would publish
-                # garbage (store) or hand garbage KV to a request (load).
-                break
-            batches.popleft()
+                if in_order:
+                    break
+                i += 1
+                continue
+            del batches[i]
             # Loads: recorded after every DMA of this batch was issued on the
             # load stream, so the event fires once the KV is on the GPU.
             # Stores: the data is already on disk; the event is just a marker.
