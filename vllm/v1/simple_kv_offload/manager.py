@@ -47,7 +47,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.simple_kv_offload.admission import (
     DEFAULT_DISK_LOAD_ADMISSION_MS,
-    DEFAULT_DISK_MIN_INFLIGHT_LOAD_BYTES,
+    DEFAULT_DISK_MIN_INFLIGHT_GPU_FRACTION,
     Admission,
     DiskLoadAdmission,
 )
@@ -164,7 +164,7 @@ class SimpleCPUOffloadScheduler:
         contiguous_alloc_window: int = 0,
         disk_max_inflight_load_bytes: int = 0,
         disk_load_admission_ms: float = DEFAULT_DISK_LOAD_ADMISSION_MS,
-        disk_min_inflight_load_bytes: int = DEFAULT_DISK_MIN_INFLIGHT_LOAD_BYTES,
+        disk_min_inflight_load_bytes: int = 0,
         disk_load_defer_timeout_ms: float = 0.0,
         disk_recompute_tokens_per_s: float = 0.0,
     ):
@@ -255,13 +255,19 @@ class SimpleCPUOffloadScheduler:
         # a slow disk defers new hits instead of parking GPU blocks on them.
         self._load_admission: DiskLoadAdmission | None = None
         if disk_capacity_bytes > 0 and disk_max_inflight_load_bytes >= 0:
+            num_gpu_blocks = max(1, kv_cache_config.num_blocks)
+            bytes_per_block = max(1, gpu_total_bytes(kv_cache_config) // num_gpu_blocks)
+            min_inflight_blocks = (
+                disk_min_inflight_load_bytes // bytes_per_block
+                if disk_min_inflight_load_bytes > 0
+                else int(num_gpu_blocks * DEFAULT_DISK_MIN_INFLIGHT_GPU_FRACTION)
+            )
             self._load_admission = DiskLoadAdmission(
-                bytes_per_block=gpu_total_bytes(kv_cache_config)
-                // max(1, kv_cache_config.num_blocks),
+                bytes_per_block=bytes_per_block,
                 tokens_per_block=self.block_size,
                 max_inflight_bytes=disk_max_inflight_load_bytes,
                 admission_ms=disk_load_admission_ms,
-                min_inflight_bytes=disk_min_inflight_load_bytes,
+                min_inflight_blocks=min_inflight_blocks,
                 defer_timeout_ms=disk_load_defer_timeout_ms,
                 recompute_tokens_per_s=disk_recompute_tokens_per_s,
             )

@@ -27,7 +27,6 @@ from vllm.v1.metrics.cache_hit_source import CacheHitSource
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.simple_kv_offload.admission import (
     DEFAULT_DISK_LOAD_ADMISSION_MS,
-    DEFAULT_DISK_MIN_INFLIGHT_LOAD_BYTES,
 )
 from vllm.v1.simple_kv_offload.disk_backend import (
     DEFAULT_DISK_ALLOC_WINDOW_BLOCKS,
@@ -214,8 +213,9 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
         use_page_cache = bool(extra_config.get("use_page_cache", False))
         # Disk load admission (scheduler side): bound the bytes of disk loads
         # accepted but not yet completed; extra hits wait without GPU blocks.
-        # disk_max_inflight_load_bytes: 0 = adaptive (measured load rate x
-        # disk_load_admission_ms, floored at disk_min_inflight_load_bytes),
+        # disk_max_inflight_load_bytes: 0 = adaptive (peak load rate x
+        # disk_load_admission_ms, floored at disk_min_inflight_load_bytes,
+        # default 0 = 5% of the GPU KV pool),
         # >0 = fixed per-rank cap, <0 = off. Optional recompute fallbacks:
         # disk_load_defer_timeout_ms and disk_recompute_tokens_per_s (0 = off).
         disk_max_inflight_load_bytes = int(
@@ -225,9 +225,7 @@ class SimpleCPUOffloadConnector(KVConnectorBase_V1, SupportsHMA):
             extra_config.get("disk_load_admission_ms", DEFAULT_DISK_LOAD_ADMISSION_MS)
         )
         disk_min_inflight_load_bytes = int(
-            extra_config.get(
-                "disk_min_inflight_load_bytes", DEFAULT_DISK_MIN_INFLIGHT_LOAD_BYTES
-            )
+            extra_config.get("disk_min_inflight_load_bytes", 0)
         )
         disk_load_defer_timeout_ms = float(
             extra_config.get("disk_load_defer_timeout_ms", 0)

@@ -18,8 +18,13 @@ so a large request cannot be starved by smaller ones behind it. When nothing
 is in flight, the head request is always admitted, however large.
 
 The budget is fixed (``disk_max_inflight_load_bytes`` > 0) or adapts to the
-measured completion rate: ``rate * disk_load_admission_ms``, floored at
-``disk_min_inflight_load_bytes``. Optional fallbacks turn a deferred hit into
+measured load rate: ``peak_rate * disk_load_admission_ms``, floored at
+``disk_min_inflight_load_bytes`` (default: a small fraction of the GPU KV
+pool). The rate is sampled over busy windows and held at its recent peak:
+while the budget binds, the observed rate is at most budget / latency, so a
+plain average would shrink the budget step after step whenever per-load
+latency (a couple of engine steps) exceeds the horizon. Optional fallbacks
+turn a deferred hit into
 recompute after ``disk_load_defer_timeout_ms``, or when the estimated load
 time exceeds the estimated recompute time at
 ``disk_recompute_tokens_per_s``.
@@ -35,13 +40,16 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-DEFAULT_DISK_LOAD_ADMISSION_MS = 1000.0
-DEFAULT_DISK_MIN_INFLIGHT_LOAD_BYTES = 1 << 30
+DEFAULT_DISK_LOAD_ADMISSION_MS = 2000.0
+# Auto floor of the budget, as a fraction of the GPU KV pool.
+DEFAULT_DISK_MIN_INFLIGHT_GPU_FRACTION = 0.05
 # Cap before the first bandwidth sample, as a multiple of the floor.
 _INITIAL_CAP_FLOOR_MULT = 4
 # Minimum busy-window length for one bandwidth sample.
 _BW_SAMPLE_S = 0.25
 _BW_EMA_ALPHA = 0.3
+# Half-life of the peak-held rate once samples fall below it.
+_PEAK_HALF_LIFE_S = 120.0
 _LOG_INTERVAL_S = 30.0
 
 
@@ -64,7 +72,7 @@ class DiskLoadAdmission:
         tokens_per_block: int,
         max_inflight_bytes: int = 0,
         admission_ms: float = DEFAULT_DISK_LOAD_ADMISSION_MS,
-        min_inflight_bytes: int = DEFAULT_DISK_MIN_INFLIGHT_LOAD_BYTES,
+        min_inflight_blocks: int = 1,
         defer_timeout_ms: float = 0.0,
         recompute_tokens_per_s: float = 0.0,
         clock: Callable[[], float] = time.monotonic,
@@ -79,15 +87,18 @@ class DiskLoadAdmission:
             else None
         )
         self.admission_s = max(0.0, admission_ms) / 1000.0
-        self.min_cap_blocks = max(1, int(min_inflight_bytes) // self.bytes_per_block)
+        self.min_cap_blocks = max(1, int(min_inflight_blocks))
         self.defer_timeout_s = max(0.0, defer_timeout_ms) / 1000.0
         self.recompute_tokens_per_s = max(0.0, recompute_tokens_per_s)
         self._clock = clock
 
         self.inflight_blocks = 0
         self._inflight_reqs = 0
-        # Completed blocks per second, EMA over busy windows.
+        # Completed blocks per second: EMA over busy windows, and its peak
+        # (slowly decaying) which sizes the adaptive budget.
         self.rate_blocks_per_s: float | None = None
+        self.peak_rate_blocks_per_s: float | None = None
+        self._peak_t = 0.0
         self._win_start: float | None = None
         self._win_blocks = 0
         # req_id -> first time it was deferred.
@@ -105,9 +116,11 @@ class DiskLoadAdmission:
     def cap_blocks(self) -> int:
         if self.fixed_cap_blocks is not None:
             return self.fixed_cap_blocks
-        if self.rate_blocks_per_s is None:
+        if self.peak_rate_blocks_per_s is None:
             return self.min_cap_blocks * _INITIAL_CAP_FLOOR_MULT
-        return max(self.min_cap_blocks, int(self.rate_blocks_per_s * self.admission_s))
+        return max(
+            self.min_cap_blocks, int(self.peak_rate_blocks_per_s * self.admission_s)
+        )
 
     def check(self, req_id: str, num_blocks: int, num_tokens: int) -> Admission:
         """Decide whether a disk hit of ``num_blocks`` may take GPU blocks now.
@@ -179,19 +192,23 @@ class DiskLoadAdmission:
             self._win_blocks += num_blocks
             elapsed = now - self._win_start
             if elapsed >= _BW_SAMPLE_S:
-                sample = self._win_blocks / elapsed
-                self.rate_blocks_per_s = (
-                    sample
-                    if self.rate_blocks_per_s is None
-                    else (1 - _BW_EMA_ALPHA) * self.rate_blocks_per_s
-                    + _BW_EMA_ALPHA * sample
-                )
+                self._add_rate_sample(self._win_blocks / elapsed, now)
                 self._win_start = now
                 self._win_blocks = 0
         if self.inflight_blocks == 0:
             # Idle time must not dilute the next sample.
             self._win_start = None
             self._win_blocks = 0
+
+    def _add_rate_sample(self, sample: float, now: float) -> None:
+        rate = self.rate_blocks_per_s
+        rate = sample if rate is None else rate + _BW_EMA_ALPHA * (sample - rate)
+        self.rate_blocks_per_s = rate
+        peak = self.peak_rate_blocks_per_s
+        if peak is not None:
+            peak *= 0.5 ** ((now - self._peak_t) / _PEAK_HALF_LIFE_S)
+        self.peak_rate_blocks_per_s = rate if peak is None else max(peak, rate)
+        self._peak_t = now
 
     def on_request_gone(self, req_id: str) -> None:
         self._deferred_since.pop(req_id, None)
@@ -206,18 +223,23 @@ class DiskLoadAdmission:
             rate = self.rate_blocks_per_s
             logger.info(
                 "SimpleCPUOffload disk admission: cap=%d blocks (%.2f GB), "
-                "inflight=%d blocks/%d reqs, waiting=%d, rate=%s GB/s, "
+                "inflight=%d blocks/%d reqs, waiting=%d, rate=%s GB/s "
+                "(peak %s), "
                 "admitted=%d deferred_steps=%d recompute=%d",
                 self.cap_blocks(),
                 self.cap_blocks() * self.bytes_per_block / 1e9,
                 self.inflight_blocks,
                 self._inflight_reqs,
                 len(self._deferred_since),
-                "n/a" if rate is None else f"{rate * self.bytes_per_block / 1e9:.2f}",
+                self._gbps(rate),
+                self._gbps(self.peak_rate_blocks_per_s),
                 self.num_admitted,
                 self.num_deferred,
                 self.num_recompute,
             )
+
+    def _gbps(self, rate: float | None) -> str:
+        return "n/a" if rate is None else f"{rate * self.bytes_per_block / 1e9:.2f}"
 
     def reset_deferrals(self) -> None:
         self._deferred_since.clear()

@@ -37,7 +37,7 @@ class FakeClock:
 
 
 def _adm(clock: FakeClock, **kw) -> DiskLoadAdmission:
-    kw.setdefault("min_inflight_bytes", 10 * BPB)
+    kw.setdefault("min_inflight_blocks", 10)
     return DiskLoadAdmission(
         bytes_per_block=BPB, tokens_per_block=16, clock=clock, **kw
     )
@@ -98,8 +98,25 @@ def test_adaptive_cap_tracks_measured_rate() -> None:
     assert adm.rate_blocks_per_s == pytest.approx(100.0)
     assert adm.cap_blocks() == 100  # 100 blocks/s * 1 s
     # Never below the floor.
-    adm.rate_blocks_per_s = 1.0
+    adm.peak_rate_blocks_per_s = 1.0
     assert adm.cap_blocks() == 10
+
+
+def test_adaptive_cap_holds_peak_while_throttled() -> None:
+    """While the cap binds, the observed rate is cap / latency; the budget
+    must not shrink with it."""
+    clock = FakeClock()
+    adm = _adm(clock, admission_ms=1000)
+    adm.on_admitted("x", 10**6)
+    for _ in range(10):
+        clock.t += 1.0
+        adm.on_released(100, completed=True)
+    assert adm.cap_blocks() == 100
+    for _ in range(5):
+        clock.t += 1.0
+        adm.on_released(20, completed=True)
+    assert adm.rate_blocks_per_s < 50
+    assert adm.cap_blocks() >= 95
 
 
 def test_idle_time_does_not_dilute_rate() -> None:
@@ -285,6 +302,14 @@ def test_cpu_backend_has_no_admission() -> None:
         disk_max_inflight_load_bytes=1,
     )
     assert sched._load_admission is None
+
+
+def test_auto_floor_is_fraction_of_gpu_pool() -> None:
+    fix = _disk_scheduler(max_inflight_blocks=0, num_gpu_blocks=200)
+    adm = fix.scheduler._load_admission
+    assert adm.fixed_cap_blocks is None
+    assert adm.min_cap_blocks == 10  # 5% of 200 GPU blocks
+    assert adm.cap_blocks() == 40  # before any rate sample
 
 
 def test_negative_cap_disables_admission() -> None:
