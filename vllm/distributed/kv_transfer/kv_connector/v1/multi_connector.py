@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import copy
+import os
+import time
 from collections.abc import Callable, Iterable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
@@ -199,6 +201,14 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
         # A mapping from request id to the index of the connector chosen to
         # load the request from (if any).
         self._requests_to_connector: dict[str, int] = {}
+        # Pick a later connector when its hit is at least this many tokens
+        # longer than the first connector's hit (<0: always first hit).
+        self._switch_margin = int(
+            os.environ.get("VLLM_MULTI_CONNECTOR_SWITCH_MARGIN_TOKENS", "-1")
+        )
+        self._chosen_counts = [0] * len(self._connectors)
+        self._chosen_tokens_later = 0
+        self._choice_log_t = 0.0
 
         # Keeps track of *additional* remaining async saves (beyond 1) to be
         # finished per request. Not needed for async loads since we only allow
@@ -472,6 +482,7 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
         num_computed_tokens: int,
     ) -> tuple[int | None, bool]:
         to_return = (0, False)
+        chosen = -1
         for i, c in enumerate(self._connectors):
             toks, load_async = c.get_num_new_matched_tokens(
                 request, num_computed_tokens
@@ -485,12 +496,40 @@ class MultiConnector(KVConnectorBase_V1, SupportsHMA):
                 # A connector that could serve the request is not ready yet:
                 # return None so the scheduler asks again later.
                 return (None, False)
-            # The first connector that has new matched tokens will be assigned
-            # to this request.
-            if to_return[0] == 0 and toks > 0:
-                self._requests_to_connector[request.request_id] = i
-                to_return = (toks, load_async)
+            if toks <= 0:
+                continue
+            if chosen < 0:
+                # By default the first connector with new matched tokens
+                # serves the request.
+                chosen, to_return = i, (toks, load_async)
+            elif (
+                self._switch_margin >= 0
+                and toks >= to_return[0] + self._switch_margin
+            ):
+                # A later connector (e.g. a larger but slower tier) holds a
+                # longer prefix than the earlier one: loading it saves more
+                # prefill compute than the faster partial hit.
+                chosen, to_return = i, (toks, load_async)
+        if chosen >= 0:
+            self._requests_to_connector[request.request_id] = chosen
+            self._chosen_counts[chosen] += 1
+            if chosen > 0:
+                self._chosen_tokens_later += to_return[0]
+            self._maybe_log_choice_stats()
         return to_return
+
+    def _maybe_log_choice_stats(self) -> None:
+        now = time.monotonic()
+        if now - self._choice_log_t < 30.0:
+            return
+        self._choice_log_t = now
+        logger.info(
+            "MultiConnector choice: per-connector requests=%s, tokens from "
+            "later connectors=%d (switch margin %d)",
+            self._chosen_counts,
+            self._chosen_tokens_later,
+            self._switch_margin,
+        )
 
     def get_external_cache_hit_sources(
         self,

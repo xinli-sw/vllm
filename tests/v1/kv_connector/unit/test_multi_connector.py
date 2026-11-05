@@ -1445,3 +1445,27 @@ def test_not_ready_child_only_defers_unserved_requests(mc, results, expected):
     for connector, result in zip(mc._connectors, results):
         connector.get_num_new_matched_tokens.return_value = result
     assert mc.get_num_new_matched_tokens(request, 0) == expected
+
+
+@pytest.mark.parametrize(
+    "margin,results,expected,chosen",
+    [
+        # Default (margin < 0): first connector with a hit wins.
+        (-1, [(16, True), (64, True)], (16, True), 0),
+        # Later connector much longer: switch.
+        (32, [(16, True), (64, False)], (64, False), 1),
+        # Later connector longer but under the margin: keep the first.
+        (64, [(16, True), (64, True)], (16, True), 0),
+        # Only the later connector hits.
+        (32, [(0, False), (48, True)], (48, True), 1),
+        # Later connector not ready while the first serves: keep the first.
+        (32, [(16, True), (None, False)], (16, True), 0),
+    ],
+)
+def test_switch_to_longer_later_hit(mc, margin, results, expected, chosen):
+    mc._switch_margin = margin
+    request = MagicMock(request_id="request")
+    for connector, result in zip(mc._connectors, results):
+        connector.get_num_new_matched_tokens.return_value = result
+    assert mc.get_num_new_matched_tokens(request, 0) == expected
+    assert mc._requests_to_connector["request"] == chosen
