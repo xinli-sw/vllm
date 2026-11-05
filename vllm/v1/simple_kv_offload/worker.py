@@ -226,7 +226,13 @@ class SimpleCPUOffloadWorker:
         )
 
         assert self.disk_path is not None
-        rank_path = f"{self.disk_path}.rank_{device.index or 0}"
+        # A comma-separated disk_path splits the node's GPUs into contiguous
+        # groups, one per path (e.g. one local RAID set per CPU socket), so
+        # their bandwidth adds up and each GPU writes to its nearer set.
+        paths = [p for p in self.disk_path.split(",") if p]
+        rank = device.index or 0
+        n_dev = max(torch.cuda.device_count(), rank + 1)
+        rank_path = f"{paths[rank * len(paths) // n_dev]}.rank_{rank}"
         self._backend = DiskBackend()
         self._backend.init(
             unique_gpu_caches,
