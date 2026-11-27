@@ -1,0 +1,246 @@
+diff -ruN '--exclude=__pycache__' a/frontend/main.py b/frontend/main.py
+--- a/frontend/main.py	2026-11-27 08:05:37.000000000 -0800
++++ b/frontend/main.py	2026-10-21 22:37:16.000000000 -0700
+@@ -265,7 +265,10 @@
+     # parse extra vllm flags using vllm native parser.
+     if config.chat_processor == "vllm":
+         try:
+-            from vllm.utils import FlexibleArgumentParser
++            try:
++                from vllm.utils import FlexibleArgumentParser
++            except ImportError:
++                from vllm.utils.argparse_utils import FlexibleArgumentParser
+         except ImportError:
+             try:
+                 from vllm.utils.argparse_utils import FlexibleArgumentParser
+@@ -291,7 +294,13 @@
+ 
+         try:
+             from vllm.engine.arg_utils import AsyncEngineArgs
+-            from vllm.entrypoints.openai.cli_args import FrontendArgs
++            try:
++                try:
++                    from vllm.entrypoints.openai.cli_args import FrontendArgs
++                except ImportError:
++                    from vllm.entrypoints.launchers.cli_args import FrontendArgs
++            except ModuleNotFoundError:
++                from vllm.entrypoints.launchers.cli_args import FrontendArgs
+         except ModuleNotFoundError:
+             logger.exception("Flag '--chat-processor vllm' requires vllm be installed.")
+             sys.exit(1)
+diff -ruN '--exclude=__pycache__' a/frontend/prepost.py b/frontend/prepost.py
+--- a/frontend/prepost.py	2026-11-27 08:05:37.000000000 -0800
++++ b/frontend/prepost.py	2026-10-21 22:37:16.000000000 -0700
+@@ -13,17 +13,23 @@
+ from functools import lru_cache
+ from typing import TYPE_CHECKING, Any, Protocol, TypeGuard, cast
+ 
+-from vllm.entrypoints.chat_utils import make_tool_call_id
++try:
++    from vllm.entrypoints.chat_utils import make_tool_call_id
++except ImportError:
++    from vllm.renderers.chat_utils.tool_call import make_tool_call_id
+ from vllm.entrypoints.openai.chat_completion.protocol import (
+     ChatCompletionNamedFunction,
+     ChatCompletionNamedToolChoiceParam,
+     ChatCompletionRequest,
+ )
+-from vllm.entrypoints.openai.engine.protocol import (
++try:
++    from vllm.entrypoints.openai.engine.protocol import (
+     DeltaFunctionCall,
+     DeltaMessage,
+     DeltaToolCall,
+-)
++    )
++except ImportError:
++    from vllm.entrypoints.generate.base.protocol import DeltaFunctionCall, DeltaMessage, DeltaToolCall
+ from vllm.reasoning import ReasoningParser
+ from vllm.renderers import ChatParams, merge_kwargs
+ from vllm.sampling_params import SamplingParams
+@@ -858,15 +864,6 @@
+         self._reasoning_parser_streaming_started = False
+         self._tool_parser_streaming_started = False
+ 
+-        # Every ORIGINAL generated token id for this choice, in order (NVBug
+-        # 6678449b). The count is delegated to the pinned vLLM parser's own
+-        # `count_reasoning_tokens`, so it is never re-derived from parser output.
+-        # Deriving it was wrong three ways: the response projections drop or
+-        # defer it (`_suppress_reasoning_output`, and the non-streaming tool
+-        # path's terminal-delta buffering); a per-chunk classifier over-counts a
+-        # chunk carrying both kinds; and re-encoding decoded text drifts from the
+-        # original ids, because detokenisation is not injective -- one generated
+-        # id can re-encode to several.
+         self._reasoning_token_ids: list[int] = []
+ 
+         self._control_markers = tuple(
+diff -ruN '--exclude=__pycache__' a/frontend/vllm_processor.py b/frontend/vllm_processor.py
+--- a/frontend/vllm_processor.py	2026-11-27 08:05:37.000000000 -0800
++++ b/frontend/vllm_processor.py	2026-10-21 22:37:16.000000000 -0700
+@@ -17,7 +17,10 @@
+ 
+ from msgspec.structs import replace as msgspec_replace
+ from vllm.config import CacheConfig, LoadConfig, ModelConfig, VllmConfig
+-from vllm.entrypoints.chat_utils import load_chat_template
++try:
++    from vllm.entrypoints.chat_utils import load_chat_template
++except ImportError:
++    from vllm.renderers.chat_utils.chat_template import load_chat_template
+ from vllm.exceptions import VLLMClientError
+ from vllm.reasoning import ReasoningParser, ReasoningParserManager
+ from vllm.sampling_params import RequestOutputKind, SamplingParams
+@@ -901,9 +904,6 @@
+         # content-part counts here too (else frontend metrics report zero media).
+         input_tokens = len(tokens)
+         cumulative_output_tokens = 0
+-        # Per-request reasoning-token usage (NVBug 6678449b); see
+-        # _ReasoningUsageAnnotator. Must be per-request, never module-level.
+-        # The counts live on the post-processors, which are per-request too.
+         reasoning_usage = _ReasoningUsageAnnotator(post_processors)
+         _mm_counts, _ = extract_mm_urls(request.get("messages") or [])
+         _mm_counts = _mm_counts or {}
+diff -ruN '--exclude=__pycache__' a/vllm/args.py b/vllm/args.py
+--- a/vllm/args.py	2026-11-27 08:05:38.000000000 -0800
++++ b/vllm/args.py	2026-10-21 22:37:16.000000000 -0700
+@@ -13,7 +13,10 @@
+ from vllm.engine.arg_utils import AsyncEngineArgs
+ 
+ try:
+-    from vllm.utils import FlexibleArgumentParser
++    try:
++        from vllm.utils import FlexibleArgumentParser
++    except ImportError:
++        from vllm.utils.argparse_utils import FlexibleArgumentParser
+ except ImportError:
+     from vllm.utils.argparse_utils import FlexibleArgumentParser
+ 
+diff -ruN '--exclude=__pycache__' a/vllm/embedding_worker_processes.py b/vllm/embedding_worker_processes.py
+--- a/vllm/embedding_worker_processes.py	2026-11-27 08:05:38.000000000 -0800
++++ b/vllm/embedding_worker_processes.py	2026-10-21 22:37:16.000000000 -0700
+@@ -13,6 +13,7 @@
+ from __future__ import annotations
+ 
+ import copy
++import importlib
+ import json
+ import logging
+ import os
+@@ -29,9 +30,43 @@
+ from vllm.config import VllmConfig
+ from vllm.usage.usage_lib import UsageContext
+ from vllm.v1.engine.async_llm import AsyncLLM
+-from vllm.v1.engine.utils import get_engine_zmq_addresses, launch_core_engines
+ from vllm.v1.executor import Executor
+ 
++# Resolved on first use, not at import: vLLM renamed get_engine_zmq_addresses in
++# vllm-project/vllm#54113, and this module is imported by every dynamo.vllm worker
++# while only --embedding-worker-processes > 1 calls into it. Module attributes so
++# tests can substitute them.
++get_engine_zmq_addresses: Callable[..., Any] | None = None
++launch_core_engines: Callable[..., Any] | None = None
++
++
++def _resolve_engine_utils() -> tuple[Callable[..., Any], Callable[..., Any]]:
++    """Bind the vLLM engine-launch helpers this pool needs, failing with a clear message.
++
++    Returns ``(get_engine_zmq_addresses, launch_core_engines)`` so callers hold
++    non-optional references; the module attributes are kept in sync for tests.
++    """
++    global get_engine_zmq_addresses, launch_core_engines
++    engine_utils = importlib.import_module("vllm.v1.engine.utils")
++
++    if launch_core_engines is None:
++        launch_core_engines = engine_utils.launch_core_engines
++    if get_engine_zmq_addresses is None:
++        resolved = getattr(engine_utils, "get_engine_zmq_addresses", None)
++        if resolved is None:
++            # vllm#54113: the supervisor now binds the frontend listeners up front and
++            # children adopt them; this pool still lets children bind the addresses
++            # themselves, so refuse rather than hand out addresses that are already bound.
++            raise RuntimeError(
++                "--embedding-worker-processes > 1 is not yet supported on this vLLM: "
++                f"vLLM {vllm.__version__} has no get_engine_zmq_addresses (it binds "
++                "frontend listeners in the supervisor since vllm-project/vllm#54113). "
++                "Run with --embedding-worker-processes 1 until the pool adopts inherited listeners."
++            )
++        get_engine_zmq_addresses = resolved
++    return get_engine_zmq_addresses, launch_core_engines
++
++
+ logger = logging.getLogger(__name__)
+ 
+ _ROLE_ENV = "DYN_VLLM_EMBEDDING_PROCESS_ROLE"
+@@ -463,7 +498,8 @@
+         vllm_config.parallel_config._api_process_count = process_count
+         vllm_config.parallel_config._api_process_rank = -1
+         executor_class = Executor.get_class(vllm_config)
+-        addresses = get_engine_zmq_addresses(vllm_config, process_count)
++        engine_zmq_addresses, core_engines_launcher = _resolve_engine_utils()
++        addresses = engine_zmq_addresses(vllm_config, process_count)
+ 
+         parent_logger_config = _client_config(
+             vllm_config,
+@@ -476,7 +512,7 @@
+         with ThreadPoolExecutor(
+             max_workers=1, thread_name_prefix="dynamo-embedding-client"
+         ) as client_pool:
+-            with launch_core_engines(
++            with core_engines_launcher(
+                 vllm_config,
+                 executor_class,
+                 not disable_log_stats,
+diff -ruN '--exclude=__pycache__' a/vllm/multimodal_utils/protocol.py b/vllm/multimodal_utils/protocol.py
+--- a/vllm/multimodal_utils/protocol.py	2026-11-27 08:05:38.000000000 -0800
++++ b/vllm/multimodal_utils/protocol.py	2026-10-21 22:37:16.000000000 -0700
+@@ -29,7 +29,10 @@
+     from vllm.inputs import MultiModalUUIDDict  # noqa: F401
+ except ImportError:
+     # vllm < 0.19.0: MultiModalUUIDDict lives in vllm.multimodal.inputs
+-    from vllm.multimodal.inputs import MultiModalUUIDDict  # noqa: F401
++    try:
++        from vllm.multimodal.inputs import MultiModalUUIDDict  # noqa: F401
++    except ImportError:
++        from vllm.inputs.llm import MultiModalUUIDDict
+ 
+ from vllm.logprobs import PromptLogprobs
+ from vllm.outputs import CompletionOutput
+@@ -69,9 +72,6 @@
+     multi_modal_data: NotRequired[Optional[Any]]  # type: ignore
+ 
+ 
+-# Monkey-patch the SamplingParams type to add a dummy core schema so pydantic can validate it
+-# Sampling params is a mspspec struct
+-# SamplingParams is defined here: https://github.com/vllm-project/vllm/blob/a4c402a756fa3213caf9d2cde0e4ceb2d57727f2/vllm/sampling_params.py#L88
+ 
+ SamplingParams.__get_pydantic_core_schema__ = classmethod(
+     lambda cls, source, handler: core_schema.any_schema()
+diff -ruN '--exclude=__pycache__' a/vllm/omni/args.py b/vllm/omni/args.py
+--- a/vllm/omni/args.py	2026-11-27 08:05:38.000000000 -0800
++++ b/vllm/omni/args.py	2026-10-21 22:37:16.000000000 -0700
+@@ -17,7 +17,10 @@
+ from vllm_omni.engine.arg_utils import OmniEngineArgs
+ 
+ try:
+-    from vllm.utils import FlexibleArgumentParser
++    try:
++        from vllm.utils import FlexibleArgumentParser
++    except ImportError:
++        from vllm.utils.argparse_utils import FlexibleArgumentParser
+ except ImportError:
+     from vllm.utils.argparse_utils import FlexibleArgumentParser
+ 
+diff -ruN '--exclude=__pycache__' a/vllm/tests/omni/test_omni_args.py b/vllm/tests/omni/test_omni_args.py
+--- a/vllm/tests/omni/test_omni_args.py	2026-11-27 08:05:38.000000000 -0800
++++ b/vllm/tests/omni/test_omni_args.py	2026-10-21 22:37:16.000000000 -0700
+@@ -416,7 +416,10 @@
+     from vllm_omni.engine.arg_utils import OmniEngineArgs
+ 
+     try:
+-        from vllm.utils import FlexibleArgumentParser
++        try:
++            from vllm.utils import FlexibleArgumentParser
++        except ImportError:
++            from vllm.utils.argparse_utils import FlexibleArgumentParser
+     except ImportError:
+         from vllm.utils.argparse_utils import FlexibleArgumentParser
+     parser = FlexibleArgumentParser(add_help=False)

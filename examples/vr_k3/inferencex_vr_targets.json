@@ -1,0 +1,14 @@
+{
+  "source": "https://inferencex.semianalysis.com/api/v1/views/inference?model=Kimi-K3&sequence=agentic-traces&gpus=vr200&best=false&percentile=p90",
+  "fetched": "2026-11-26",
+  "system": "Vera Rubin NVL72 (Dynamo vLLM), fp4, DSpark (mtp), disagg",
+  "note": "tpPerGpu is the site's tok/s/chip with chipBasis=pool; output/input split shown separately",
+  "points": [
+    {"conc": 1,   "gpus": 24, "layout": "1P TP8 / 1D TP16", "kv_offload": false, "p90_interactivity": 862.07, "tput_per_gpu": 1359.30,  "output_tput_per_gpu": 12.49,  "input_tput_per_gpu": 4052.92,  "date": "2026-10-23", "row": 446538},
+    {"conc": 8,   "gpus": 24, "layout": "1P TP8 / 1D TP16", "kv_offload": false, "p90_interactivity": 591.72, "tput_per_gpu": 2998.06,  "output_tput_per_gpu": 30.33,  "input_tput_per_gpu": 8933.53,  "date": "2026-10-23", "row": 446540},
+    {"conc": 48,  "gpus": 32, "layout": "2P TP8 / 1D TP16", "kv_offload": true,  "p90_interactivity": 342.47, "tput_per_gpu": 11769.35, "output_tput_per_gpu": 153.40, "input_tput_per_gpu": 23385.29, "date": "2026-10-23", "row": 446544},
+    {"conc": 64,  "gpus": 24, "layout": "1P TP8 / 1D TP16", "kv_offload": true,  "p90_interactivity": 250.00, "tput_per_gpu": 21174.06, "output_tput_per_gpu": 218.25, "input_tput_per_gpu": 63085.67, "date": "2026-10-23", "row": 446539},
+    {"conc": 160, "gpus": 32, "layout": "2P TP8 / 1D TP16", "kv_offload": true,  "p90_interactivity": 171.23, "tput_per_gpu": 31704.84, "output_tput_per_gpu": 451.48, "input_tput_per_gpu": 62958.21, "date": "2026-10-23", "row": 446541},
+    {"conc": 256, "gpus": 32, "layout": "2P TP8 / 1D TP16", "kv_offload": true,  "p90_interactivity": 102.35, "tput_per_gpu": 44755.07, "output_tput_per_gpu": 625.45, "input_tput_per_gpu": 88884.70, "date": "2026-10-23", "row": 446545}
+  ]
+}

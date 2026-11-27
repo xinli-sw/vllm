@@ -1,0 +1,16 @@
+diff --git a/infx/launch/drivers/srt/collect.py b/infx/launch/drivers/srt/collect.py
+index 2cd09331..34dd4739 100644
+--- a/infx/launch/drivers/srt/collect.py
++++ b/infx/launch/drivers/srt/collect.py
+@@ -209,7 +209,10 @@ def collect(
+                 if not request.is_agentic:
+                     copy_fixed_sequence_results(logs, run.workspace, request.result_filename)
+                 elif not power.agentx:
+-                    copy_agentic_results(infmax, run.workspace, request.result_filename)
++                    agentic_logs = logs / "agentic"
++                    pattern = f"{request.result_filename}_conc*.json"
++                    source = agentic_logs if any(agentic_logs.glob(pattern)) else infmax
++                    copy_agentic_results(source, run.workspace, request.result_filename)
+             except ArtifactError as error:
+                 event.error(error)
+                 rc = rc or 1

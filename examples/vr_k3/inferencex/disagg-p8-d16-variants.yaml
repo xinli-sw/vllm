@@ -1,0 +1,505 @@
+schema: 2
+
+base:
+  identity:
+    model: {}
+    container: {}
+    frameworks:
+      vllm: "0.32.0rc1.dev190+g3f1bcfd82.d20261015.cu134"
+      dynamo: "1.5.0"
+
+  dynamo:
+    install: false
+
+  slurm:
+    time_limit: "04:00:00"
+
+  health_check:
+    max_attempts: 720
+    interval_seconds: 10
+
+  resources:
+    gpu_type: "vrnvl72"
+    gpus_per_node: 4
+
+  services:
+  - name: etcd
+    type: etcd
+    placement:
+      node: infra
+  - name: nats
+    type: nats
+    placement:
+      node: infra
+    options:
+      max_payload_mb: 32
+  - &mc_master
+    name: mooncake-master
+    type: mooncake-master
+    args:
+    - "--default_kv_lease_ttl=5000"
+    - "--eviction_high_watermark_ratio=0.95"
+    - "--eviction_ratio=0.10"
+    options:
+      store_config:
+        metadata_server: "P2PHANDSHAKE"
+        global_segment_size: "160GB"
+        local_buffer_size: "4GB"
+        protocol: "rdma"
+        device_name: "mlx5_0,mlx5_1,mlx5_2,mlx5_5"
+        mode: "embedded"
+        enable_offload: false
+  - &dloan
+    name: dloan
+    type: generic
+    start: before_workers
+    placement:
+      node: decode
+    command: ["bash", "/opt/k3/bin/dloan.sh"]
+    cpu_bind: none
+    env:
+      DLOAN_MASTER: "{infra_ip}:8700"
+      DLOAN_ADMIN: "{infra_ip}:8702"
+      DLOAN_HOST: "{node_ip}"
+      DLOAN_INDEX: "{index}"
+      DLOAN_GB: "600"
+      DLOAN_NICS0: "mlx5_0,mlx5_1,mlx5_2,mlx5_5"
+      DLOAN_NICS1: "mlx5_0,mlx5_1,mlx5_2,mlx5_5"
+      DLOAN_SPLIT: "2"
+      DLOAN_OUT: "/logs/dloan"
+
+  frontend:
+    type: dynamo
+    enable_multiple_frontends: false
+    args:
+      router-mode: "least-loaded"
+      router-session-affinity-ttl-secs: 900
+      dyn-chat-processor: vllm
+      trust-remote-code: true
+    env:
+      HF_HUB_CACHE: "/opt/k3/fe-hf-view/mxfp4"
+      HF_HUB_OFFLINE: "1"
+      PYTHONPATH: "/opt/k3/ov-fe-conv:/opt/k3/dynamo-conv"
+      DYN_FORWARD_SESSION_ID: "1"
+      DYN_METADATA_HEADER: "x-dynamo-"
+      DYN_ROUTER_ACTIVE_REQUEST_EXPIRY_SECS: "3600"
+      DYN_TOKENIZER_CACHE_BYTES: "8589934592"
+      DYN_TCP_REQUEST_TIMEOUT: "120"
+      VLLM_K3_FAST_SPLIT: "1"
+      VLLM_K3_TOKCACHE_BYTES: "512M"
+      VLLM_K3_SKIP_ID_VALIDATION: "1"
+      VLLM_K3_BYTE_DETOK: "1"
+
+  engine:
+    type: vllm
+    connector: null
+
+  environment:
+    UCX_GPU_NIC_ASSIGNMENT_MODE: "off"
+    DYN_TCP_REQUEST_TIMEOUT: "120"
+    DYN_REQUEST_PLANE: "tcp"
+    ETCD_LEASE_TTL: "600"
+    VLLM_USE_DIRECT_DCP_A2A: "1"
+    VLLM_USE_DIRECT_DCP_Q_GATHER: "1"
+    VLLM_USE_DIRECT_DCP_KV_GATHER: "1"
+    VLLM_ALLREDUCE_USE_FLASHINFER: "1"
+    VLLM_RPC_TIMEOUT: "600000"
+    VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: "1800"
+    VLLM_USE_V2_MODEL_RUNNER: "1"
+    VLLM_USE_RUST_FRONTEND: "1"
+    VLLM_SERVER_DEV_MODE: "1"
+    VLLM_ENGINE_READY_TIMEOUT_S: "3600"
+    VLLM_MOONCAKE_LOAD_RECV_THREADS: "4"
+    MC_SLICE_SIZE: "1048576"
+    MC_MAX_MR_SIZE: "4294967296"
+    MC_ENABLE_DEST_DEVICE_AFFINITY: "1"
+    WITH_NVIDIA_PEERMEM: "0"
+    NCCL_MNNVL_ENABLE: "1"
+    NCCL_CUMEM_ENABLE: "1"
+    NCCL_NVLS_ENABLE: "1"
+    NCCL_P2P_LEVEL: "NVL"
+    NCCL_NET_PLUGIN: "none"
+    VLLM_USE_NCCL_SYMM_MEM: "0"
+    UCX_TLS: "rc,cuda_copy"
+    UCX_NET_DEVICES: "mlx5_0:1,mlx5_1:1,mlx5_2:1,mlx5_5:1,mlx5_6:1,mlx5_7:1,mlx5_8:1,mlx5_11:1"
+    UCX_MEMTYPE_CACHE: "n"
+    UCX_MEMTYPE_REG_WHOLE: "n"
+    UCX_RCACHE_MAX_UNRELEASED: "1024"
+    UCX_TCP_AF_PRIO: "inet"
+    VLLM_SSM_CONV_STATE_LAYOUT: "DS"
+    VLLM_WORKER_MULTIPROC_METHOD: "spawn"
+    TRITON_CACHE_DIR: "/opt/k3/jit-cache/triton"
+    CUDA_CACHE_PATH: "/opt/k3/jit-cache/nvcache"
+    CUDA_CACHE_MAXSIZE: "4294967296"
+    VLLM_CACHE_ROOT: "/opt/k3/jit-cache/vllm"
+    CUTE_DSL_CACHE_DIR: "/opt/k3/jit-cache/cute"
+    TORCHINDUCTOR_CACHE_DIR: "/opt/k3/jit-cache/inductor"
+    FLASHINFER_WORKSPACE_BASE: "/opt/k3/jit-cache/flashinfer"
+    DG_JIT_CACHE_DIR: "/opt/k3/jit-cache/deepgemm"
+    K3_CUTE_CACHE: "/opt/k3/startup-cache"
+
+  roles:
+    prefill:
+      nodes: 2
+      workers: 1
+      gpus: 8
+      env:
+        PYTHONPATH: "/opt/k3/ov-prel:/opt/k3/dynamo"
+        HF_HUB_OFFLINE: "1"
+        VLLM_MLA_DCP_CONTEXT_CHUNK_TOKENS: "131072"
+        VLLM_KIMI_K3_GEMM_AR: "1"
+        VLLM_KIMI_K3_MOE_TOKEN_SHARD: "1"
+        VLLM_KIMI_K3_MOE_TOKEN_SHARD_GEMM_AR: "1"
+        VLLM_KIMI_K3_MOE_TOKEN_SHARD_GEMM_AR_MIN_TOKENS: "288"
+        VLLM_KIMI_K3_VEC_SITU: "1"
+        VLLM_KIMI_K3_GEMM_AR_ALIAS: "1"
+        VLLM_K3_DCP_CTX_TAIL_SPLIT: "1"
+        VLLM_K3_DCP_CTX_WAVE_SPLIT: "1"
+        VLLM_K3_KDA_SEGSCAN: "1"
+        VLLM_K3_CTXREC_FUSED: "1"
+      args: &p_args
+        prefix-cache-policy: "v2"
+        enable-mamba-shared-prefix-checkpoint: true
+        mamba-conversation-max-turns: 5
+        mamba-conversation-max-turns-mode: "demote"
+        mamba-low-priority-snapshot-prompt-len: 16384
+        mamba-internal-snapshot: true
+        kv-transfer-config: '{"kv_connector":"MultiConnector","kv_role":"kv_both","kv_load_failure_policy":"recompute","kv_connector_extra_config":{"cache_prefix":"k3-p8dcp8-ilv896-bs896-fp8kv-bf16ssm-dl7","connectors":[{"kv_connector":"NixlConnector","kv_role":"kv_both","kv_load_failure_policy":"fail","kv_buffer_device":"cuda","kv_connector_extra_config":{"enforce_handshake_compat":false,"enable_cross_layers_blocks":false,"ucx_net_devices_by_gpu":"0=mlx5_0:1+mlx5_6:1;1=mlx5_1:1+mlx5_7:1;2=mlx5_2:1+mlx5_8:1;3=mlx5_5:1+mlx5_11:1","kv_lease_duration":60}},{"kv_connector":"MooncakeStoreConnector","kv_role":"kv_both","kv_load_failure_policy":"recompute","kv_connector_extra_config":{"store_op_failover":true,"store_op_timeout_s":30,"load_async":true,"lookup_async":true,"lookup_from_local_hit":true,"prune_superseded_checkpoints":true,"prune_delay_s":6,"prune_policy":"lag1","prune_lag_ttl_s":600,"enable_cross_layers_blocks":false,"cache_prefix":"k3-p8dcp8-ilv896-bs896-fp8kv-bf16ssm-dl7"}}]}}'
+        served-model-name: "moonshotai/Kimi-K3"
+        load-format: "fastsafetensors"
+        kv-cache-dtype: "fp8"
+        mamba-ssm-cache-dtype: "bfloat16"
+        gpu-memory-utilization: 0.95
+        tensor-parallel-size: 8
+        long-prefill-token-threshold: 8192
+        long-prefill-token-threshold-adaptive: true
+        decode-context-parallel-size: 8
+        block-size: 896
+        cp-kv-cache-interleave-size: 896
+        enable-cumem-allocator: true
+        dcp-comm-backend: "a2a"
+        trust-remote-code: true
+        language-model-only: true
+        enable-expert-parallel: true
+        moe-backend: "deep_gemm_mega_moe"
+        no-enable-flashinfer-autotune: true
+        attention-backend: "TOKENSPEED_MLA"
+        attention-config: '{"mla_prefill_backend":"TRTLLM_RAGGED","use_prefill_query_quantization":true}'
+        quantization-config: '{"moe":{"activation":"mxfp8"}}'
+        enable-prefix-caching: true
+        prefix-match-unit: 128
+        max-model-len: 1048576
+        max-num-batched-tokens: 16384
+        max-num-seqs: 32
+        max-cudagraph-capture-size: 2048
+        compilation-config: '{"cudagraph_capture_sizes":[7,8,14,16,28,32,56,64,112,128,168,192,224,256,384,512,640,768,896,1024,1280,1536,1792,2048]}'
+        stream-interval: 10
+        numa-bind: true
+        numa-bind-nodes: [0, 0, 1, 1]
+        distributed-timeout-seconds: 1800
+        cpu-distributed-timeout-seconds: 1800
+        speculative-config: '{"method":"dspark","model":"/raid/common-models/kimi-k3-dspark","num_speculative_tokens":7,"attention_backend":"TOKENSPEED_MLA","draft_sample_method":"probabilistic","rejection_sample_method":"block"}'
+      kv_events: true
+    decode:
+      nodes: 4
+      workers: 1
+      gpus: 16
+      env:
+        PYTHONPATH: "/opt/k3/ov-d:/opt/k3/dynamo:/opt/k3/startup-hook:/opt/k3/pinhook"
+        HF_HUB_OFFLINE: "1"
+        K3_CUTE_CACHE: "/opt/k3/startup-cache"
+        K3_CUTE_PATHNORM: "1"
+        K3_PIN_CPUS: "1"
+        VLLM_MM_EMBEDS_ON_CONSUMERS: "0"
+        VLLM_K3_KDA_SEGSCAN: "0"
+        VLLM_KIMI_K3_DS_T2P: "0"
+        VLLM_KIMI_K3_DS_LPC: "0"
+        VLLM_USE_NCCL_SYMM_MEM: "0"
+      args: &d_args
+        kv-transfer-config: '{"kv_connector":"NixlConnector","kv_role":"kv_consumer","kv_load_failure_policy":"recompute","kv_buffer_device":"cuda","kv_connector_extra_config":{"enforce_handshake_compat":false,"enable_cross_layers_blocks":false,"ucx_net_devices_by_gpu":"0=mlx5_0:1+mlx5_6:1;1=mlx5_1:1+mlx5_7:1;2=mlx5_2:1+mlx5_8:1;3=mlx5_5:1+mlx5_11:1","kv_lease_duration":60,"kv_lease_check_timeout_s":10}}'
+        served-model-name: "moonshotai/Kimi-K3"
+        load-format: "fastsafetensors"
+        kv-cache-dtype: "fp8"
+        mamba-ssm-cache-dtype: "bfloat16"
+        gpu-memory-utilization: 0.90
+        tensor-parallel-size: 16
+        decode-context-parallel-size: 16
+        block-size: 896
+        cp-kv-cache-interleave-size: 896
+        enable-cumem-allocator: true
+        dcp-comm-backend: "a2a"
+        trust-remote-code: true
+        language-model-only: true
+        moe-backend: "auto"
+        no-enable-flashinfer-autotune: true
+        attention-backend: "TOKENSPEED_MLA"
+        attention-config: '{"mla_prefill_backend":"TRTLLM_RAGGED","use_prefill_query_quantization":true}'
+        quantization-config: '{"moe":{"activation":"mxfp8"}}'
+        enable-prefix-caching: true
+        prefix-match-unit: 128
+        max-model-len: 1048576
+        max-num-batched-tokens: 8192
+        stream-interval: 10
+        additional-config: '{"decode_backend":"latency_specialized"}'
+        speculative-config: '{"method":"dspark","model":"/raid/common-models/kimi-k3-dspark","num_speculative_tokens":7,"attention_backend":"TOKENSPEED_MLA","draft_sample_method":"probabilistic","rejection_sample_method":"block"}'
+        distributed-timeout-seconds: 1800
+        cpu-distributed-timeout-seconds: 1800
+  sbatch_directives:
+    mem: "0"
+    cpus-per-task: "352"
+
+  srun_options:
+    mem: "0"
+    cpu-bind: none
+
+  host_setup:
+    commands:
+    - python3 -c 'import subprocess,sys; r=subprocess.run(["nvidia-smi","--query-gpu=index,clocks.mem","--format=csv,noheader,nounits"],stdout=subprocess.PIPE,text=True); rows=[l.split(",") for l in r.stdout.splitlines() if l.strip()]; sys.exit(0 if len(rows)==4 and all(x[1].strip()=="4752" for x in rows) else "memory clock != 4752 MHz")'
+    nodes: workers
+    ignore_failure: false
+    timeout_seconds: 120
+
+  benchmark:
+    placement:
+      node: head
+    env:
+      AIPERF_USE_DYNAMO_CONV_AWARE_ROUTING: "0"
+      AIPERF_HTTP_X_DYNAMO_SESSION_ID_FROM_CORRELATION_ID: "true"
+      AIPERF_DYNAMO_SESSION_TIMEOUT_SECONDS: "14400"
+
+
+override_1p1d_dl7_nixl:
+  services:
+  - {name: etcd, type: etcd, placement: {node: infra}}
+  - {name: nats, type: nats, placement: {node: infra}, options: {max_payload_mb: 32}}
+  roles:
+    prefill:
+      nodes: 2
+      workers: 1
+      args:
+        kv-transfer-config: '{"kv_connector":"NixlConnector","kv_role":"kv_both","kv_load_failure_policy":"fail","kv_buffer_device":"cuda","kv_connector_extra_config":{"enforce_handshake_compat":false,"enable_cross_layers_blocks":false,"ucx_net_devices_by_gpu":"0=mlx5_0:1+mlx5_6:1;1=mlx5_1:1+mlx5_7:1;2=mlx5_2:1+mlx5_8:1;3=mlx5_5:1+mlx5_11:1","kv_lease_duration":60}}'
+    decode:
+      nodes: 4
+      workers: 1
+      args:
+        max-num-seqs: 32
+        max-cudagraph-capture-size: 256
+        compilation-config: '{"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[7,8,14,16,21,24,28,32,35,40,42,48,49,56,63,64,70,72,77,80,84,88,91,96,98,104,105,112,119,120,126,128,133,136,140,144,147,152,154,160,161,168,175,176,182,184,189,192,196,200,203,208,210,216,217,224,232,240,248,256]}'
+
+override_1p1d_dl7_nixl_eval:
+  frontend:
+    env:
+      PYTHONPATH: "/opt/k3/ov-fe-conv:/opt/k3/dynamo-conv-eval"
+      DYN_VLLMPROC_FIXES: "1"
+  services:
+  - {name: etcd, type: etcd, placement: {node: infra}}
+  - {name: nats, type: nats, placement: {node: infra}, options: {max_payload_mb: 32}}
+  roles:
+    prefill:
+      nodes: 2
+      workers: 1
+      args:
+        kv-transfer-config: '{"kv_connector":"NixlConnector","kv_role":"kv_both","kv_load_failure_policy":"fail","kv_buffer_device":"cuda","kv_connector_extra_config":{"enforce_handshake_compat":false,"enable_cross_layers_blocks":false,"ucx_net_devices_by_gpu":"0=mlx5_0:1+mlx5_6:1;1=mlx5_1:1+mlx5_7:1;2=mlx5_2:1+mlx5_8:1;3=mlx5_5:1+mlx5_11:1","kv_lease_duration":60}}'
+        reasoning-parser: kimi_k3
+        dyn-tool-call-parser: kimi_k3
+        dyn-reasoning-parser: kimi_k3
+        dyn-enable-structural-tag: true
+    decode:
+      nodes: 4
+      workers: 1
+      args:
+        max-num-seqs: 32
+        max-cudagraph-capture-size: 256
+        compilation-config: '{"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[7,8,14,16,21,24,28,32,35,40,42,48,49,56,63,64,70,72,77,80,84,88,91,96,98,104,105,112,119,120,126,128,133,136,140,144,147,152,154,160,161,168,175,176,182,184,189,192,196,200,203,208,210,216,217,224,232,240,248,256]}'
+        reasoning-parser: kimi_k3
+        dyn-tool-call-parser: kimi_k3
+        dyn-reasoning-parser: kimi_k3
+        dyn-enable-structural-tag: true
+
+override_1p1d_dl7_mc:
+  roles:
+    prefill:
+      nodes: 2
+      workers: 1
+      args: {}
+    decode:
+      nodes: 4
+      workers: 1
+      args:
+        max-num-seqs: 32
+        max-cudagraph-capture-size: 256
+        compilation-config: '{"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[7,8,14,16,21,24,28,32,35,40,42,48,49,56,63,64,70,72,77,80,84,88,91,96,98,104,105,112,119,120,126,128,133,136,140,144,147,152,154,160,161,168,175,176,182,184,189,192,196,200,203,208,210,216,217,224,232,240,248,256]}'
+
+override_1p1d_dl7_mc_eval:
+  frontend:
+    env:
+      PYTHONPATH: "/opt/k3/ov-fe-conv:/opt/k3/dynamo-conv-eval"
+      DYN_VLLMPROC_FIXES: "1"
+  roles:
+    prefill:
+      nodes: 2
+      workers: 1
+      args:
+        reasoning-parser: kimi_k3
+        dyn-tool-call-parser: kimi_k3
+        dyn-reasoning-parser: kimi_k3
+        dyn-enable-structural-tag: true
+    decode:
+      nodes: 4
+      workers: 1
+      args:
+        max-num-seqs: 32
+        max-cudagraph-capture-size: 256
+        compilation-config: '{"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[7,8,14,16,21,24,28,32,35,40,42,48,49,56,63,64,70,72,77,80,84,88,91,96,98,104,105,112,119,120,126,128,133,136,140,144,147,152,154,160,161,168,175,176,182,184,189,192,196,200,203,208,210,216,217,224,232,240,248,256]}'
+        reasoning-parser: kimi_k3
+        dyn-tool-call-parser: kimi_k3
+        dyn-reasoning-parser: kimi_k3
+        dyn-enable-structural-tag: true
+
+override_2p1d_dl3_cap64_mc:
+  roles:
+    prefill:
+      nodes: 4
+      workers: 2
+      args:
+        kv-transfer-config: '{"kv_connector":"MultiConnector","kv_role":"kv_both","kv_load_failure_policy":"recompute","kv_connector_extra_config":{"cache_prefix":"k3-p8dcp8-ilv896-bs896-fp8kv-bf16ssm-dl3","connectors":[{"kv_connector":"NixlConnector","kv_role":"kv_both","kv_load_failure_policy":"fail","kv_buffer_device":"cuda","kv_connector_extra_config":{"enforce_handshake_compat":false,"enable_cross_layers_blocks":false,"ucx_net_devices_by_gpu":"0=mlx5_0:1+mlx5_6:1;1=mlx5_1:1+mlx5_7:1;2=mlx5_2:1+mlx5_8:1;3=mlx5_5:1+mlx5_11:1","kv_lease_duration":60}},{"kv_connector":"MooncakeStoreConnector","kv_role":"kv_both","kv_load_failure_policy":"recompute","kv_connector_extra_config":{"store_op_failover":true,"store_op_timeout_s":30,"load_async":true,"lookup_async":true,"lookup_from_local_hit":false,"prune_superseded_checkpoints":true,"prune_delay_s":6,"prune_policy":"lag1","prune_lag_ttl_s":600,"enable_cross_layers_blocks":false,"cache_prefix":"k3-p8dcp8-ilv896-bs896-fp8kv-bf16ssm-dl3"}}]}}'
+        speculative-config: '{"method":"dspark","model":"/raid/common-models/kimi-k3-dspark","num_speculative_tokens":3,"attention_backend":"TOKENSPEED_MLA","draft_sample_method":"probabilistic","rejection_sample_method":"block"}'
+        mamba-extra-tail-checkpoint-tokens: 1024
+    decode:
+      nodes: 4
+      workers: 1
+      args:
+        max-num-seqs: 64
+        max-cudagraph-capture-size: 256
+        compilation-config: '{"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[6,8,15,16,18,20,21,24,30,32,39,40,45,48,54,56,63,64,66,68,69,72,75,76,78,80,81,84,87,88,90,92,93,96,100,102,104,108,112,114,116,120,124,126,128,132,136,138,144,150,152,156,160,162,168,174,176,180,184,186,192,200,208,216,224,232,240,248,256]}'
+        speculative-config: '{"method":"dspark","model":"/raid/common-models/kimi-k3-dspark","num_speculative_tokens":3,"attention_backend":"TOKENSPEED_MLA","draft_sample_method":"probabilistic","rejection_sample_method":"block"}'
+
+override_2p1d_dl3_cap64_mc_eval:
+  frontend:
+    env:
+      PYTHONPATH: "/opt/k3/ov-fe-conv:/opt/k3/dynamo-conv-eval"
+      DYN_VLLMPROC_FIXES: "1"
+  roles:
+    prefill:
+      nodes: 4
+      workers: 2
+      args:
+        kv-transfer-config: '{"kv_connector":"MultiConnector","kv_role":"kv_both","kv_load_failure_policy":"recompute","kv_connector_extra_config":{"cache_prefix":"k3-p8dcp8-ilv896-bs896-fp8kv-bf16ssm-dl3","connectors":[{"kv_connector":"NixlConnector","kv_role":"kv_both","kv_load_failure_policy":"fail","kv_buffer_device":"cuda","kv_connector_extra_config":{"enforce_handshake_compat":false,"enable_cross_layers_blocks":false,"ucx_net_devices_by_gpu":"0=mlx5_0:1+mlx5_6:1;1=mlx5_1:1+mlx5_7:1;2=mlx5_2:1+mlx5_8:1;3=mlx5_5:1+mlx5_11:1","kv_lease_duration":60}},{"kv_connector":"MooncakeStoreConnector","kv_role":"kv_both","kv_load_failure_policy":"recompute","kv_connector_extra_config":{"store_op_failover":true,"store_op_timeout_s":30,"load_async":true,"lookup_async":true,"lookup_from_local_hit":false,"prune_superseded_checkpoints":true,"prune_delay_s":6,"prune_policy":"lag1","prune_lag_ttl_s":600,"enable_cross_layers_blocks":false,"cache_prefix":"k3-p8dcp8-ilv896-bs896-fp8kv-bf16ssm-dl3"}}]}}'
+        speculative-config: '{"method":"dspark","model":"/raid/common-models/kimi-k3-dspark","num_speculative_tokens":3,"attention_backend":"TOKENSPEED_MLA","draft_sample_method":"probabilistic","rejection_sample_method":"block"}'
+        mamba-extra-tail-checkpoint-tokens: 1024
+        reasoning-parser: kimi_k3
+        dyn-tool-call-parser: kimi_k3
+        dyn-reasoning-parser: kimi_k3
+        dyn-enable-structural-tag: true
+    decode:
+      nodes: 4
+      workers: 1
+      args:
+        max-num-seqs: 64
+        max-cudagraph-capture-size: 256
+        compilation-config: '{"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[6,8,15,16,18,20,21,24,30,32,39,40,45,48,54,56,63,64,66,68,69,72,75,76,78,80,81,84,87,88,90,92,93,96,100,102,104,108,112,114,116,120,124,126,128,132,136,138,144,150,152,156,160,162,168,174,176,180,184,186,192,200,208,216,224,232,240,248,256]}'
+        speculative-config: '{"method":"dspark","model":"/raid/common-models/kimi-k3-dspark","num_speculative_tokens":3,"attention_backend":"TOKENSPEED_MLA","draft_sample_method":"probabilistic","rejection_sample_method":"block"}'
+        reasoning-parser: kimi_k3
+        dyn-tool-call-parser: kimi_k3
+        dyn-reasoning-parser: kimi_k3
+        dyn-enable-structural-tag: true
+
+override_2p1d_dl3_cap128_mc:
+  services:
+  - {name: etcd, type: etcd, placement: {node: infra}}
+  - {name: nats, type: nats, placement: {node: infra}, options: {max_payload_mb: 32}}
+  - name: mooncake-master
+    type: mooncake-master
+    args: ["--default_kv_lease_ttl=5000", "--eviction_high_watermark_ratio=0.95", "--eviction_ratio=0.10"]
+    options:
+      store_config:
+        metadata_server: "P2PHANDSHAKE"
+        global_segment_size: "200GB"
+        local_buffer_size: "4GB"
+        protocol: "rdma"
+        device_name: "mlx5_0,mlx5_1,mlx5_2,mlx5_5"
+        mode: "embedded"
+        enable_offload: false
+  - name: dloan
+    type: generic
+    start: before_workers
+    placement: {node: decode}
+    command: ["bash", "/opt/k3/bin/dloan.sh"]
+    cpu_bind: none
+    env: {DLOAN_MASTER: "{infra_ip}:8700", DLOAN_ADMIN: "{infra_ip}:8702", DLOAN_HOST: "{node_ip}", DLOAN_INDEX: "{index}", DLOAN_GB: "950", DLOAN_NICS0: "mlx5_0,mlx5_1,mlx5_2,mlx5_5", DLOAN_NICS1: "mlx5_0,mlx5_1,mlx5_2,mlx5_5", DLOAN_SPLIT: "2", DLOAN_OUT: "/logs/dloan"}
+  roles:
+    prefill:
+      nodes: 4
+      workers: 2
+      env:
+        PYTHONPATH: "/opt/k3/ov-prel:/opt/k3/dynamo"
+      args:
+        kv-transfer-config: '{"kv_connector":"MultiConnector","kv_role":"kv_both","kv_load_failure_policy":"recompute","kv_connector_extra_config":{"cache_prefix":"k3-p8dcp8-ilv896-bs896-fp8kv-bf16ssm-dl3","connectors":[{"kv_connector":"NixlConnector","kv_role":"kv_both","kv_load_failure_policy":"fail","kv_buffer_device":"cuda","kv_connector_extra_config":{"enforce_handshake_compat":false,"enable_cross_layers_blocks":false,"ucx_net_devices_by_gpu":"0=mlx5_0:1+mlx5_6:1;1=mlx5_1:1+mlx5_7:1;2=mlx5_2:1+mlx5_8:1;3=mlx5_5:1+mlx5_11:1","kv_lease_duration":60}},{"kv_connector":"MooncakeStoreConnector","kv_role":"kv_both","kv_load_failure_policy":"recompute","kv_connector_extra_config":{"store_op_failover":true,"store_op_timeout_s":30,"load_async":true,"lookup_async":true,"lookup_from_local_hit":false,"prune_superseded_checkpoints":true,"prune_delay_s":6,"prune_policy":"lag1","prune_lag_ttl_s":330,"enable_cross_layers_blocks":false,"cache_prefix":"k3-p8dcp8-ilv896-bs896-fp8kv-bf16ssm-dl3"}}]}}'
+        speculative-config: '{"method":"dspark","model":"/raid/common-models/kimi-k3-dspark","num_speculative_tokens":3,"attention_backend":"TOKENSPEED_MLA","draft_sample_method":"probabilistic","rejection_sample_method":"block"}'
+        mamba-extra-tail-checkpoint-tokens: 1024
+    decode:
+      nodes: 4
+      workers: 1
+      env:
+        PYTHONPATH: "/opt/k3/ov-pd128:/opt/k3/dynamo:/opt/k3/startup-hook:/opt/k3/pinhook"
+      args:
+        max-num-seqs: 128
+        max-cudagraph-capture-size: 512
+        compilation-config: '{"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[6,8,15,16,18,20,21,24,30,32,39,40,45,48,54,56,63,64,66,68,69,72,75,76,78,80,81,84,87,88,90,92,93,96,100,102,104,108,112,114,116,120,124,126,128,132,136,138,144,150,152,156,160,162,168,174,176,180,184,186,192,200,204,208,216,224,228,232,240,248,252,256,264,272,276,288,300,304,312,320,324,336,348,352,360,368,372,384,400,416,432,448,464,480,496,512]}'
+        speculative-config: '{"method":"dspark","model":"/raid/common-models/kimi-k3-dspark","num_speculative_tokens":3,"attention_backend":"TOKENSPEED_MLA","draft_sample_method":"probabilistic","rejection_sample_method":"block"}'
+
+override_2p1d_dl3_cap128_mc_eval:
+  frontend:
+    env:
+      PYTHONPATH: "/opt/k3/ov-fe-conv:/opt/k3/dynamo-conv-eval"
+      DYN_VLLMPROC_FIXES: "1"
+  services:
+  - {name: etcd, type: etcd, placement: {node: infra}}
+  - {name: nats, type: nats, placement: {node: infra}, options: {max_payload_mb: 32}}
+  - name: mooncake-master
+    type: mooncake-master
+    args: ["--default_kv_lease_ttl=5000", "--eviction_high_watermark_ratio=0.95", "--eviction_ratio=0.10"]
+    options:
+      store_config:
+        metadata_server: "P2PHANDSHAKE"
+        global_segment_size: "200GB"
+        local_buffer_size: "4GB"
+        protocol: "rdma"
+        device_name: "mlx5_0,mlx5_1,mlx5_2,mlx5_5"
+        mode: "embedded"
+        enable_offload: false
+  - name: dloan
+    type: generic
+    start: before_workers
+    placement: {node: decode}
+    command: ["bash", "/opt/k3/bin/dloan.sh"]
+    cpu_bind: none
+    env: {DLOAN_MASTER: "{infra_ip}:8700", DLOAN_ADMIN: "{infra_ip}:8702", DLOAN_HOST: "{node_ip}", DLOAN_INDEX: "{index}", DLOAN_GB: "950", DLOAN_NICS0: "mlx5_0,mlx5_1,mlx5_2,mlx5_5", DLOAN_NICS1: "mlx5_0,mlx5_1,mlx5_2,mlx5_5", DLOAN_SPLIT: "2", DLOAN_OUT: "/logs/dloan"}
+  roles:
+    prefill:
+      nodes: 4
+      workers: 2
+      env:
+        PYTHONPATH: "/opt/k3/ov-prel:/opt/k3/dynamo"
+      args:
+        kv-transfer-config: '{"kv_connector":"MultiConnector","kv_role":"kv_both","kv_load_failure_policy":"recompute","kv_connector_extra_config":{"cache_prefix":"k3-p8dcp8-ilv896-bs896-fp8kv-bf16ssm-dl3","connectors":[{"kv_connector":"NixlConnector","kv_role":"kv_both","kv_load_failure_policy":"fail","kv_buffer_device":"cuda","kv_connector_extra_config":{"enforce_handshake_compat":false,"enable_cross_layers_blocks":false,"ucx_net_devices_by_gpu":"0=mlx5_0:1+mlx5_6:1;1=mlx5_1:1+mlx5_7:1;2=mlx5_2:1+mlx5_8:1;3=mlx5_5:1+mlx5_11:1","kv_lease_duration":60}},{"kv_connector":"MooncakeStoreConnector","kv_role":"kv_both","kv_load_failure_policy":"recompute","kv_connector_extra_config":{"store_op_failover":true,"store_op_timeout_s":30,"load_async":true,"lookup_async":true,"lookup_from_local_hit":false,"prune_superseded_checkpoints":true,"prune_delay_s":6,"prune_policy":"lag1","prune_lag_ttl_s":330,"enable_cross_layers_blocks":false,"cache_prefix":"k3-p8dcp8-ilv896-bs896-fp8kv-bf16ssm-dl3"}}]}}'
+        speculative-config: '{"method":"dspark","model":"/raid/common-models/kimi-k3-dspark","num_speculative_tokens":3,"attention_backend":"TOKENSPEED_MLA","draft_sample_method":"probabilistic","rejection_sample_method":"block"}'
+        mamba-extra-tail-checkpoint-tokens: 1024
+        reasoning-parser: kimi_k3
+        dyn-tool-call-parser: kimi_k3
+        dyn-reasoning-parser: kimi_k3
+        dyn-enable-structural-tag: true
+    decode:
+      nodes: 4
+      workers: 1
+      env:
+        PYTHONPATH: "/opt/k3/ov-pd128:/opt/k3/dynamo:/opt/k3/startup-hook:/opt/k3/pinhook"
+      args:
+        max-num-seqs: 128
+        max-cudagraph-capture-size: 512
+        compilation-config: '{"cudagraph_mode":"FULL_AND_PIECEWISE","cudagraph_capture_sizes":[6,8,15,16,18,20,21,24,30,32,39,40,45,48,54,56,63,64,66,68,69,72,75,76,78,80,81,84,87,88,90,92,93,96,100,102,104,108,112,114,116,120,124,126,128,132,136,138,144,150,152,156,160,162,168,174,176,180,184,186,192,200,204,208,216,224,228,232,240,248,252,256,264,272,276,288,300,304,312,320,324,336,348,352,360,368,372,384,400,416,432,448,464,480,496,512]}'
+        speculative-config: '{"method":"dspark","model":"/raid/common-models/kimi-k3-dspark","num_speculative_tokens":3,"attention_backend":"TOKENSPEED_MLA","draft_sample_method":"probabilistic","rejection_sample_method":"block"}'
+        reasoning-parser: kimi_k3
+        dyn-tool-call-parser: kimi_k3
+        dyn-reasoning-parser: kimi_k3
+        dyn-enable-structural-tag: true

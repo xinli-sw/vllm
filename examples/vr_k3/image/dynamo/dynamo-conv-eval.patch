@@ -1,0 +1,569 @@
+diff -ruN '--exclude=__pycache__' a/frontend/main.py b/frontend/main.py
+--- a/frontend/main.py	2026-11-27 08:05:37.000000000 -0800
++++ b/frontend/main.py	2026-10-21 22:37:35.000000000 -0700
+@@ -265,7 +265,10 @@
+     # parse extra vllm flags using vllm native parser.
+     if config.chat_processor == "vllm":
+         try:
+-            from vllm.utils import FlexibleArgumentParser
++            try:
++                from vllm.utils import FlexibleArgumentParser
++            except ImportError:
++                from vllm.utils.argparse_utils import FlexibleArgumentParser
+         except ImportError:
+             try:
+                 from vllm.utils.argparse_utils import FlexibleArgumentParser
+@@ -291,7 +294,13 @@
+ 
+         try:
+             from vllm.engine.arg_utils import AsyncEngineArgs
+-            from vllm.entrypoints.openai.cli_args import FrontendArgs
++            try:
++                try:
++                    from vllm.entrypoints.openai.cli_args import FrontendArgs
++                except ImportError:
++                    from vllm.entrypoints.launchers.cli_args import FrontendArgs
++            except ModuleNotFoundError:
++                from vllm.entrypoints.launchers.cli_args import FrontendArgs
+         except ModuleNotFoundError:
+             logger.exception("Flag '--chat-processor vllm' requires vllm be installed.")
+             sys.exit(1)
+@@ -398,6 +407,12 @@
+         event_plane=config.event_plane,
+     )
+ 
++    if os.environ.get("DYN_CONV_ROUTER", "0") not in ("", "0"):
++        # Conversation-affine prefill placement (vLLM ConversationRouter port).
++        from dynamo.frontend import vllm_processor as _conv_vp
++
++        _conv_vp.set_conv_router_runtime(runtime)
++
+     def signal_handler():
+         asyncio.create_task(graceful_shutdown(runtime))
+ 
+diff -ruN '--exclude=__pycache__' a/frontend/prepost.py b/frontend/prepost.py
+--- a/frontend/prepost.py	2026-11-27 08:05:37.000000000 -0800
++++ b/frontend/prepost.py	2026-10-21 22:37:35.000000000 -0700
+@@ -13,17 +13,23 @@
+ from functools import lru_cache
+ from typing import TYPE_CHECKING, Any, Protocol, TypeGuard, cast
+ 
+-from vllm.entrypoints.chat_utils import make_tool_call_id
++try:
++    from vllm.entrypoints.chat_utils import make_tool_call_id
++except ImportError:
++    from vllm.renderers.chat_utils.tool_call import make_tool_call_id
+ from vllm.entrypoints.openai.chat_completion.protocol import (
+     ChatCompletionNamedFunction,
+     ChatCompletionNamedToolChoiceParam,
+     ChatCompletionRequest,
+ )
+-from vllm.entrypoints.openai.engine.protocol import (
++try:
++    from vllm.entrypoints.openai.engine.protocol import (
+     DeltaFunctionCall,
+     DeltaMessage,
+     DeltaToolCall,
+-)
++    )
++except ImportError:
++    from vllm.entrypoints.generate.base.protocol import DeltaFunctionCall, DeltaMessage, DeltaToolCall
+ from vllm.reasoning import ReasoningParser
+ from vllm.renderers import ChatParams, merge_kwargs
+ from vllm.sampling_params import SamplingParams
+@@ -446,6 +452,30 @@
+     )
+ 
+ 
++def _apply_vllm_structural_tag(
++    request: ChatCompletionRequest,
++    tool_parser_class: type[ToolParser],
++    tokenizer: TokenizerLike,
++) -> ChatCompletionRequest:
++    """DYN_VLLMPROC_FIXES: run vLLM's own DelegatingParser._apply_structural_tag (what
++    `vllm serve` does before the tool parser's adjust_request) for forced tool choices
++    (required / named). Parsers with a builtin structural-tag model (Kimi K3: XTML)
++    need that tag attached first: K3 rejects a named choice without it, and leaves
++    "required" unconstrained. `auto` is left as it was."""
++    if not request.tools or not _is_forced_tool_choice(request.tool_choice):
++        return request
++    if getattr(tool_parser_class, "structural_tag_model", None) is None:
++        return request
++    from vllm.parser.abstract_parser import DelegatingParser
++
++    parser_cls = type(
++        "_DynamoDelegatingParser",
++        (DelegatingParser,),
++        {"tool_parser_cls": tool_parser_class, "reasoning_parser_cls": None},
++    )
++    return parser_cls(tokenizer, request.tools)._apply_structural_tag(request)
++
++
+ def _prepare_request(
+     request: dict[str, Any] | ChatCompletionRequest,
+     *,
+@@ -490,6 +520,10 @@
+     if tool_parser_class and (has_tools or enable_auto_tool_choice):
+         if request_for_sampling.tool_choice != "none":
+             tool_parser = tool_parser_class(tokenizer, request_for_sampling.tools)
++            if _VLLMPROC_FIXES:
++                request_for_sampling = _apply_vllm_structural_tag(
++                    request_for_sampling, tool_parser_class, tokenizer
++                )
+             request_for_sampling = tool_parser.adjust_request(request_for_sampling)
+ 
+     # Strip tools from the template when tool_choice=none so the model doesn't
+@@ -794,6 +828,10 @@
+     return re.compile("|".join(re.escape(m) for m in ordered))
+ 
+ 
++# DYN_VLLMPROC_FIXES=1 (default off; patched copy, 10-20): see vllm_processor.py.
++_VLLMPROC_FIXES = os.environ.get("DYN_VLLMPROC_FIXES", "0") not in ("", "0")
++
++
+ class StreamingPostProcessor:
+     def __init__(
+         self,
+@@ -1056,6 +1094,18 @@
+             stripped = stripped.replace(marker, "")
+         return stripped.strip() == ""
+ 
++    def _strips_content_wrapper(self) -> bool:
++        """DYN_VLLMPROC_FIXES (G7): the reasoning parser strips a content wrapper itself
++        when no tool parser runs (Kimi K3: strip_content_streaming), as vLLM's glue does."""
++        rp = self.reasoning_parser
++        return (
++            rp is not None
++            and not self._should_parse_tools()
++            and callable(getattr(rp, "strip_content_streaming", None))
++            and callable(getattr(rp, "_strip_content_wrapper", None))
++            and callable(getattr(rp, "_content_ready_to_emit", None))
++        )
++
+     def _should_parse_tools(self) -> bool:
+         return (
+             self.tool_parser is not None
+@@ -1433,6 +1483,49 @@
+                             saved_reasoning,
+                             None,
+                         )
++                elif (
++                    _VLLMPROC_FIXES
++                    and post_content
++                    and self._should_parse_tools()
++                ):
++                    # post-reasoning text of the transition chunk is the tool
++                    # phase's first input. The Kimi K3 tool parser consumes the
++                    # XTML response-channel header ("<|open|>response<|sep|>")
++                    # there; emitting the text raw leaked it into streamed content.
++                    content_ids = list(delta_token_ids)
++                    try:
++                        content_ids = self.reasoning_parser.extract_content_ids(
++                            delta_token_ids
++                        )
++                    except Exception:  # noqa: BLE001 - keep the delta ids
++                        pass
++                    current_text = post_content
++                    current_token_ids = list(content_ids)
++                    tool_message = self._extract_tool_calls_streaming(
++                        current_text=post_content,
++                        delta_text=post_content,
++                        current_token_ids=current_token_ids,
++                        delta_token_ids=current_token_ids,
++                    )
++                    delta_message = self._merge_delta_messages(
++                        self._compose_delta_message(
++                            reasoning=saved_reasoning, content=None
++                        ),
++                        tool_message,
++                    )
++                elif _VLLMPROC_FIXES and self._strips_content_wrapper():
++                    # vLLM's K3 parser glue strips the XTML response-channel wrapper
++                    # here (reasoning_parser.strip_content_streaming over the
++                    # post-reasoning text); emitting it raw leaked
++                    # "<|open|>response<|sep|>" into streamed content.
++                    current_text = post_content
++                    stripped = self.reasoning_parser.strip_content_streaming(
++                        "", post_content
++                    )
++                    delta_message = self._compose_delta_message(
++                        reasoning=saved_reasoning,
++                        content=stripped.content if stripped else None,
++                    )
+                 else:
+                     # Plain content (or no content) after reasoning end.
+                     delta_message = self._compose_delta_message(
+@@ -1455,6 +1548,23 @@
+                     current_token_ids=current_token_ids,
+                     delta_token_ids=delta_token_ids,
+                 )
++        elif (
++            _VLLMPROC_FIXES
++            and self.reasoning_is_done
++            and self.reasoning_parser is not None
++            and self._strips_content_wrapper()
++        ):
++            delta_message = self.reasoning_parser.strip_content_streaming(
++                self.previous_text, current_text
++            )
++            if output.finish_reason:
++                # flush: the streaming strip holds back a trailing partial marker
++                final = self.reasoning_parser._strip_content_wrapper(current_text)
++                sent = self.reasoning_parser._content_ready_to_emit(current_text)
++                if final.startswith(sent) and len(final) > len(sent):
++                    delta_message = self._merge_delta_messages(
++                        delta_message, DeltaMessage(content=final[len(sent):])
++                    )
+         else:
+             if self._should_parse_tools():
+                 no_prev_reasoning = (
+diff -ruN '--exclude=__pycache__' a/frontend/vllm_processor.py b/frontend/vllm_processor.py
+--- a/frontend/vllm_processor.py	2026-11-27 08:05:37.000000000 -0800
++++ b/frontend/vllm_processor.py	2026-10-21 22:37:35.000000000 -0700
+@@ -17,7 +17,10 @@
+ 
+ from msgspec.structs import replace as msgspec_replace
+ from vllm.config import CacheConfig, LoadConfig, ModelConfig, VllmConfig
+-from vllm.entrypoints.chat_utils import load_chat_template
++try:
++    from vllm.entrypoints.chat_utils import load_chat_template
++except ImportError:
++    from vllm.renderers.chat_utils.chat_template import load_chat_template
+ from vllm.exceptions import VLLMClientError
+ from vllm.reasoning import ReasoningParser, ReasoningParserManager
+ from vllm.sampling_params import RequestOutputKind, SamplingParams
+@@ -114,6 +117,69 @@
+         annotated["completion_tokens_details"] = details
+         return annotated
+ 
++# DYN_CONV_ROUTER=1 (default off): pin each request's prefill worker with the
++# conversation-affine placement of vllm.entrypoints.conversation_router (a port
++# of TensorRT-LLM's ConversationRouter). DYN_CONV_ROUTER_PREFILL_ENDPOINT names
++# the prefill endpoint (namespace.component.endpoint); the conversation id is
++# the context metadata key DYN_CONV_ROUTER_SESSION_KEY ("session-id": run the
++# frontend with DYN_METADATA_HEADER=x-dynamo- to map X-Dynamo-Session-ID).
++_CONV_ROUTER_ENABLED = os.environ.get("DYN_CONV_ROUTER", "0") not in ("", "0")
++# DYN_FORWARD_SESSION_ID=1 (default off): forward the session id to the worker
++# as SamplingParams.extra_args["conversation_id"] (vLLM
++# --mamba-conversation-max-turns keys its per-conversation retention on it).
++_FORWARD_SESSION_ID = os.environ.get("DYN_FORWARD_SESSION_ID", "0") not in ("", "0")
++_SESSION_KEY = os.environ.get("DYN_CONV_ROUTER_SESSION_KEY", "session-id")
++
++
++def _forward_session_id(dynamo_preproc: dict[str, Any], context: Any) -> None:
++    metadata = getattr(context, "metadata", None) if context is not None else None
++    session_id = metadata.get(_SESSION_KEY) if metadata is not None else None
++    if not session_id:
++        return
++    options = dynamo_preproc.setdefault("extra_args", {}).setdefault(
++        "sampling_options", {}
++    )
++    extra_args = dict(options.get("extra_args") or {})
++    extra_args["conversation_id"] = session_id
++    options["extra_args"] = extra_args
++_conv_router_runtime: Any = None
++_conv_placer: Any = None
++
++
++def set_conv_router_runtime(runtime: Any) -> None:
++    global _conv_router_runtime
++    _conv_router_runtime = runtime
++
++
++async def _get_conv_placer() -> Any:
++    global _conv_placer
++    if _conv_placer is not None or _conv_router_runtime is None:
++        return _conv_placer
++    from vllm.entrypoints.conversation_router import PrefillPlacer
++
++    endpoint = os.environ["DYN_CONV_ROUTER_PREFILL_ENDPOINT"]
++    client = await _conv_router_runtime.endpoint(endpoint).client()
++    await client.wait_for_instances()
++    placer = PrefillPlacer.from_env(client.instance_ids)
++    logger.info(
++        "conversation router on %s: %d prefill instances, follow_load_factor=%s, "
++        "min_match_blocks=%d x %d tokens",
++        endpoint,
++        len(client.instance_ids()),
++        placer.router.follow_load_factor,
++        placer.router.min_match_blocks,
++        placer.router.tokens_per_block,
++    )
++    _conv_placer = placer
++    return _conv_placer
++
++
++# DYN_VLLMPROC_FIXES=1 (default off; patched copy, 10-20): forward cache_salt to the
++# worker (nvext), stop the worker when a stop string matches here, and route the
++# post-reasoning text of the transition chunk through the tool parser (prepost.py).
++_VLLMPROC_FIXES = os.environ.get("DYN_VLLMPROC_FIXES", "0") not in ("", "0")
++_VLLMPROC_DEBUG = os.environ.get("DYN_VLLMPROC_DEBUG", "0") not in ("", "0")
++
+ 
+ def map_finish_reason(raw_reason: str | None) -> FinishReason | None:
+     if raw_reason is None:
+@@ -743,6 +809,26 @@
+         }
+         if guided_decoding is not None:
+             dynamo_preproc["sampling_options"]["guided_decoding"] = guided_decoding
++        # (extra_args.nvext.cache_salt, read by dynamo.vllm _apply_nvext_cache_salt);
++        # without it per-tenant prefix-cache isolation is lost.
++        if _VLLMPROC_FIXES:
++            salt = request_for_sampling.cache_salt
++            if salt is None:  # the Rust HTTP layer may carry it in nvext / routing
++                salt = (request.get("nvext") or {}).get("cache_salt") or (
++                    request.get("routing") or {}
++                ).get("cache_salt")
++            if _VLLMPROC_DEBUG:
++                logger.warning(
++                    "fe-debug request keys=%s nvext=%s routing=%s salt=%r",
++                    sorted(request),
++                    sorted(request.get("nvext") or {}),
++                    request.get("routing"),
++                    salt,
++                )
++            if salt is not None:
++                dynamo_preproc.setdefault("extra_args", {}).setdefault("nvext", {})[
++                    "cache_salt"
++                ] = salt
+         if reasoning_metadata.engine_reasoning_ended is not None:
+             dynamo_preproc[
+                 "reasoning_ended"
+@@ -824,17 +910,38 @@
+                 output_idx: new_post_processor() for output_idx in range(sp.n)
+             }
+ 
+-            async for item in self._generate_and_stream(
+-                request_id,
+-                request,
+-                dynamo_preproc,
+-                tokens,
+-                vllm_preproc,
+-                post_processors,
+-                mm_routing_info=mm_routing_info,
+-                context=context,
+-            ):
+-                yield item
++            if _FORWARD_SESSION_ID:
++                _forward_session_id(dynamo_preproc, context)
++            conv_placer = await _get_conv_placer() if _CONV_ROUTER_ENABLED else None
++            conv_placement = None
++            if conv_placer is not None:
++                nvext = (dynamo_preproc.get("extra_args") or {}).get("nvext") or {}
++                conv_placement = await conv_placer.place(
++                    tokens, context, nvext.get("cache_salt")
++                )
++                if conv_placement is not None:
++                    routing = dict(dynamo_preproc.get("routing") or {})
++                    routing["prefill_worker_id"] = conv_placement.server
++                    dynamo_preproc["routing"] = routing
++            try:
++                async for item in self._generate_and_stream(
++                    request_id,
++                    request,
++                    dynamo_preproc,
++                    tokens,
++                    vllm_preproc,
++                    post_processors,
++                    mm_routing_info=mm_routing_info,
++                    context=context,
++                ):
++                    if conv_placement is not None:
++                        # First output: the prefill is done, its backlog gone.
++                        conv_placer.finish(conv_placement)
++                        conv_placement = None
++                    yield item
++            finally:
++                if conv_placement is not None:
++                    conv_placer.finish(conv_placement)
+         finally:
+             if cleanup_items and self._sender is not None:
+                 await self._sender.cleanup(cleanup_items)
+@@ -901,6 +1008,7 @@
+         # content-part counts here too (else frontend metrics report zero media).
+         input_tokens = len(tokens)
+         cumulative_output_tokens = 0
++        kept_before = 0
+         # Per-request reasoning-token usage (NVBug 6678449b); see
+         # _ReasoningUsageAnnotator. Must be per-request, never module-level.
+         # The counts live on the post-processors, which are per-request too.
+@@ -996,8 +1104,8 @@
+                     [vllm_response]
+                 )
+ 
+-                if vllm_out.reqs_to_abort:
+-                    pass
++                # know. Finish this envelope with usage and stop the worker.
++                stop_now = _VLLMPROC_FIXES and bool(vllm_out.reqs_to_abort)
+ 
+                 choices = []
+                 postprocess_error = False
+@@ -1039,6 +1147,19 @@
+                     }
+                     if usage := engine_response.get("completion_usage"):
+                         dynamo_out["usage"] = reasoning_usage.annotate(usage)
++                    elif stop_now:
++                        kept = sum(
++                            len(o.token_ids)
++                            for ro in vllm_out.request_outputs
++                            for o in ro.outputs
++                        ) + kept_before
++                        dynamo_out["usage"] = reasoning_usage.annotate(
++                            {
++                                "prompt_tokens": input_tokens,
++                                "completion_tokens": kept,
++                                "total_tokens": input_tokens + kept,
++                            }
++                        )
+                     envelope["data"] = dynamo_out
+ 
+                 metrics = {
+@@ -1057,6 +1178,13 @@
+                 envelope["comment"] = [json.dumps(metrics)]
+ 
+                 yield envelope
++                kept_before += sum(
++                    len(o.token_ids) for ro in vllm_out.request_outputs for o in ro.outputs
++                )
++                if stop_now:
++                    if context is not None:
++                        context.stop_generating()
++                    break
+             _nvtx.end_range(rng_stream)
+         except VLLMClientError:
+             # Preserve request-side 400/404/422 errors for generator(), which
+diff -ruN '--exclude=__pycache__' a/vllm/args.py b/vllm/args.py
+--- a/vllm/args.py	2026-11-27 08:05:38.000000000 -0800
++++ b/vllm/args.py	2026-10-21 22:37:33.000000000 -0700
+@@ -13,7 +13,10 @@
+ from vllm.engine.arg_utils import AsyncEngineArgs
+ 
+ try:
+-    from vllm.utils import FlexibleArgumentParser
++    try:
++        from vllm.utils import FlexibleArgumentParser
++    except ImportError:
++        from vllm.utils.argparse_utils import FlexibleArgumentParser
+ except ImportError:
+     from vllm.utils.argparse_utils import FlexibleArgumentParser
+ 
+diff -ruN '--exclude=__pycache__' a/vllm/embedding_worker_processes.py b/vllm/embedding_worker_processes.py
+--- a/vllm/embedding_worker_processes.py	2026-11-27 08:05:38.000000000 -0800
++++ b/vllm/embedding_worker_processes.py	2026-10-21 22:37:12.000000000 -0700
+@@ -13,6 +13,7 @@
+ from __future__ import annotations
+ 
+ import copy
++import importlib
+ import json
+ import logging
+ import os
+@@ -29,9 +30,43 @@
+ from vllm.config import VllmConfig
+ from vllm.usage.usage_lib import UsageContext
+ from vllm.v1.engine.async_llm import AsyncLLM
+-from vllm.v1.engine.utils import get_engine_zmq_addresses, launch_core_engines
+ from vllm.v1.executor import Executor
+ 
++# Resolved on first use, not at import: vLLM renamed get_engine_zmq_addresses in
++# vllm-project/vllm#54113, and this module is imported by every dynamo.vllm worker
++# while only --embedding-worker-processes > 1 calls into it. Module attributes so
++# tests can substitute them.
++get_engine_zmq_addresses: Callable[..., Any] | None = None
++launch_core_engines: Callable[..., Any] | None = None
++
++
++def _resolve_engine_utils() -> tuple[Callable[..., Any], Callable[..., Any]]:
++    """Bind the vLLM engine-launch helpers this pool needs, failing with a clear message.
++
++    Returns ``(get_engine_zmq_addresses, launch_core_engines)`` so callers hold
++    non-optional references; the module attributes are kept in sync for tests.
++    """
++    global get_engine_zmq_addresses, launch_core_engines
++    engine_utils = importlib.import_module("vllm.v1.engine.utils")
++
++    if launch_core_engines is None:
++        launch_core_engines = engine_utils.launch_core_engines
++    if get_engine_zmq_addresses is None:
++        resolved = getattr(engine_utils, "get_engine_zmq_addresses", None)
++        if resolved is None:
++            # vllm#54113: the supervisor now binds the frontend listeners up front and
++            # children adopt them; this pool still lets children bind the addresses
++            # themselves, so refuse rather than hand out addresses that are already bound.
++            raise RuntimeError(
++                "--embedding-worker-processes > 1 is not yet supported on this vLLM: "
++                f"vLLM {vllm.__version__} has no get_engine_zmq_addresses (it binds "
++                "frontend listeners in the supervisor since vllm-project/vllm#54113). "
++                "Run with --embedding-worker-processes 1 until the pool adopts inherited listeners."
++            )
++        get_engine_zmq_addresses = resolved
++    return get_engine_zmq_addresses, launch_core_engines
++
++
+ logger = logging.getLogger(__name__)
+ 
+ _ROLE_ENV = "DYN_VLLM_EMBEDDING_PROCESS_ROLE"
+@@ -463,7 +498,8 @@
+         vllm_config.parallel_config._api_process_count = process_count
+         vllm_config.parallel_config._api_process_rank = -1
+         executor_class = Executor.get_class(vllm_config)
+-        addresses = get_engine_zmq_addresses(vllm_config, process_count)
++        engine_zmq_addresses, core_engines_launcher = _resolve_engine_utils()
++        addresses = engine_zmq_addresses(vllm_config, process_count)
+ 
+         parent_logger_config = _client_config(
+             vllm_config,
+@@ -476,7 +512,7 @@
+         with ThreadPoolExecutor(
+             max_workers=1, thread_name_prefix="dynamo-embedding-client"
+         ) as client_pool:
+-            with launch_core_engines(
++            with core_engines_launcher(
+                 vllm_config,
+                 executor_class,
+                 not disable_log_stats,
+diff -ruN '--exclude=__pycache__' a/vllm/multimodal_utils/protocol.py b/vllm/multimodal_utils/protocol.py
+--- a/vllm/multimodal_utils/protocol.py	2026-11-27 08:05:38.000000000 -0800
++++ b/vllm/multimodal_utils/protocol.py	2026-10-21 22:37:33.000000000 -0700
+@@ -29,7 +29,10 @@
+     from vllm.inputs import MultiModalUUIDDict  # noqa: F401
+ except ImportError:
+     # vllm < 0.19.0: MultiModalUUIDDict lives in vllm.multimodal.inputs
+-    from vllm.multimodal.inputs import MultiModalUUIDDict  # noqa: F401
++    try:
++        from vllm.multimodal.inputs import MultiModalUUIDDict  # noqa: F401
++    except ImportError:
++        from vllm.inputs.llm import MultiModalUUIDDict
+ 
+ from vllm.logprobs import PromptLogprobs
+ from vllm.outputs import CompletionOutput
+diff -ruN '--exclude=__pycache__' a/vllm/omni/args.py b/vllm/omni/args.py
+--- a/vllm/omni/args.py	2026-11-27 08:05:38.000000000 -0800
++++ b/vllm/omni/args.py	2026-10-21 22:37:33.000000000 -0700
+@@ -17,7 +17,10 @@
+ from vllm_omni.engine.arg_utils import OmniEngineArgs
+ 
+ try:
+-    from vllm.utils import FlexibleArgumentParser
++    try:
++        from vllm.utils import FlexibleArgumentParser
++    except ImportError:
++        from vllm.utils.argparse_utils import FlexibleArgumentParser
+ except ImportError:
+     from vllm.utils.argparse_utils import FlexibleArgumentParser
+ 
+diff -ruN '--exclude=__pycache__' a/vllm/tests/omni/test_omni_args.py b/vllm/tests/omni/test_omni_args.py
+--- a/vllm/tests/omni/test_omni_args.py	2026-11-27 08:05:38.000000000 -0800
++++ b/vllm/tests/omni/test_omni_args.py	2026-10-21 22:37:33.000000000 -0700
+@@ -416,7 +416,10 @@
+     from vllm_omni.engine.arg_utils import OmniEngineArgs
+ 
+     try:
+-        from vllm.utils import FlexibleArgumentParser
++        try:
++            from vllm.utils import FlexibleArgumentParser
++        except ImportError:
++            from vllm.utils.argparse_utils import FlexibleArgumentParser
+     except ImportError:
+         from vllm.utils.argparse_utils import FlexibleArgumentParser
+     parser = FlexibleArgumentParser(add_help=False)
