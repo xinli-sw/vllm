@@ -3151,11 +3151,16 @@ class NixlBaseConnectorWorker:
                 or group.host_resident
             ):
                 continue
+            # A host (DRAM) cache shared across ranks is rank 0's to write, as in
+            # _zero_region_blocks; any other cache this group owns is zeroed.
             caches = [
                 self.device_kv_caches[name]
                 for name in group.layer_names
                 if name in self.device_kv_caches
-                and self.device_kv_caches[name].device.type != "cpu"
+                and not (
+                    self._skip_dram_xfer
+                    and self.device_kv_caches[name].device.type == "cpu"
+                )
             ]
             if not caches:
                 continue

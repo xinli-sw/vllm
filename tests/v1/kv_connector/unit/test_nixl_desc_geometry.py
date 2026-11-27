@@ -917,6 +917,9 @@ def _run_hetero_case(
         t.fill_(0xAA)
 
     worker._read_blocks_for_req("req-b", meta)
+    # As start_load_kv does after posting every pull of the step: launch the
+    # zeroing of the blocks the posted reads leave unwritten.
+    worker._flush_unwritten_zeroing()
 
     # Invariant 1: all local writes within the request's own blocks.
     owned = _owned_byte_ranges(worker, local_ids)
